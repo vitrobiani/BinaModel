@@ -25,42 +25,42 @@ paths:
 specialists:
   caries:
     config:      configs/models/caries.yaml
-    weight:      yolo11s.pt          # starting weights (downloaded automatically)
+    weight:      yolo26s.pt          # starting weights (downloaded automatically)
     conf_thresh: 0.40                # min confidence to accept a pseudo-label
     iou_thresh:  0.45                # NMS iou during specialist inference
     class_id:    0                   # id in the UNIFIED class list below
 
   gingivitis:
     config:      configs/models/gingivitis.yaml
-    weight:      yolo11s.pt
+    weight:      yolo26s.pt
     conf_thresh: 0.45
     iou_thresh:  0.45
     class_id:    1
 
   plaque:
     config:      configs/models/plaque.yaml
-    weight:      yolo11s.pt
+    weight:      yolo26s.pt
     conf_thresh: 0.35                # looser — plaque boundaries are diffuse
     iou_thresh:  0.50
     class_id:    2
 
   discoloration:
     config:      configs/models/discoloration.yaml
-    weight:      yolo11s.pt
+    weight:      yolo26s.pt
     conf_thresh: 0.40
     iou_thresh:  0.45
     class_id:    3
 
   ulcer:
     config:      configs/models/ulcer.yaml
-    weight:      yolo11s.pt
+    weight:      yolo26s.pt
     conf_thresh: 0.50                # tighter — ulcers are small & precise
     iou_thresh:  0.40
     class_id:    4
 
   recession:
     config:      configs/models/recession.yaml
-    weight:      yolo11s.pt
+    weight:      yolo26s.pt
     conf_thresh: 0.38
     iou_thresh:  0.45
     class_id:    5
@@ -86,6 +86,15 @@ kpi_gate:
   map50_min:      0.85   # mAP@0.5 on test
   precision_min:  0.95   # at the val-calibrated threshold
   recall_min:     0.60   # at the same threshold
+
+# ── Phase 1A specialist arch sweep (Ultralytics-compatible) ──
+# These slugs are passed to sweep.py / hpo.py; the weight file is f"{slug}.pt"
+# and is auto-downloaded by Ultralytics on first use. Phase 1B (Faster R-CNN,
+# DETR) will be added in a separate config block once those adapters land.
+specialist_archs:
+  - yolo26s            # current baseline, direct YOLO11s migration
+  - yolo26x            # heavy YOLO sanity-check on capacity ceiling
+  - rtdetr-l           # transformer real-time detector
 
 # ── HPO (plan §5.1) — Optuna mini-run defaults ───────────────
 # These are search-space bounds and budget hints; the runner overrides via CLI.
@@ -130,7 +139,7 @@ train:
 
 # ── Student model training ───────────────────────────────────
 student:
-  weight:        yolo11m.pt          # bigger backbone for the fused model
+  weight:        yolo26m.pt          # bigger backbone for the fused model
   epochs:        120
   imgsz:         640
   batch:         12

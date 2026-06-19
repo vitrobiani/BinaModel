@@ -5,22 +5,30 @@ Top-level orchestrator for the full Bina training pipeline.
 
 Phases (in canonical order):
   1. normalize  — convert raw datasets to YOLO format (stratified 70/15/15)
-  2. hpo        — Optuna mini-runs to discover per-specialist hyperparams
+  2. hpo        — Optuna mini-runs for the current default architecture
                   (writes runs/hpo/<cond>_best.json; auto-picked up by train)
-  3. train      — train 6 specialist models
-  4. validate   — PR-curve threshold calibration + KPI gate against test set
-                  (writes threshold.json + kpi_gate.json next to each ckpt)
-  5. pseudo     — ensemble inference over unlabeled images, merge annotations
-  6. student    — train final multi-class model on real + pseudo data
-  7. export     — ONNX export + latency benchmark (hardware viability gate)
+  3. sweep      — Multi-arch Phase 1: for each (arch, condition), run HPO →
+                  train → threshold → KPI gate. Writes runs/sweep/results.json.
+                  Each arch lives in its own runs/sweep/<arch>/specialist_<c>/.
+  4. promote    — Pick the per-condition winner from the sweep and copy it
+                  into runs/specialists/specialist_<cond>/ for downstream use.
+  5. train      — Single-arch specialist training (legacy / re-training a
+                  promoted arch with different overrides).
+  6. validate   — PR-curve threshold calibration + KPI gate against test set
+                  (writes threshold.json + kpi_gate.json next to each ckpt).
+  7. pseudo     — Ensemble inference over unlabeled images, merge annotations.
+  8. student    — Train final multi-class model on real + pseudo data.
+  9. export     — ONNX export + latency benchmark (hardware viability gate).
 
 `--phase all` runs normalize → train → validate → pseudo → student → export.
-HPO is intentionally NOT in `all` because it's exploratory and slow; run it
-explicitly with `--phase hpo` when you want to refresh per-condition configs.
+HPO, sweep, and promote are intentionally NOT in `all` because they're heavy
+and exploratory; invoke them explicitly when you want to refresh configs or
+rerun the Phase-1 arch comparison.
 
 Usage:
   python src/pipeline.py --phase all
-  python src/pipeline.py --phase hpo --conditions recession
+  python src/pipeline.py --phase sweep --conditions recession caries
+  python src/pipeline.py --phase promote
   python src/pipeline.py --phase validate
   python src/pipeline.py --phase export --target specialists
 """
@@ -39,6 +47,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from data.normalize import NORMALIZERS
 from train.train_specialist import train_specialist
 from train.hpo import run_hpo
+from train.sweep import run_sweep, ULTRALYTICS_ARCHS, _summary_table as _sweep_summary
+from train.promote import promote
 from inference.ensemble import load_specialists, run_ensemble
 from inference.merge import (
     merge_detections,
@@ -69,6 +79,34 @@ def phase_normalize(conditions: list[str], domain_shift: bool):
         print(f"\n  [{cond}]")
         NORMALIZERS[cond](domain_shift=domain_shift)
     print("\n✓ Phase 1 complete.")
+
+
+# ── Phase 1B: Multi-architecture specialist sweep (Phase 1A of the plan) ─────
+
+def phase_sweep(archs: list[str], conditions: list[str], *,
+                skip_hpo: bool, hpo_trials: int, hpo_epochs: int,
+                hpo_fraction: float, hpo_seed: int, resume: bool):
+    print("\n" + "█" * 60)
+    print("  PHASE 1B — MULTI-ARCH SPECIALIST SWEEP")
+    print("█" * 60)
+    out = run_sweep(
+        archs, conditions,
+        skip_hpo=skip_hpo,
+        hpo_trials=hpo_trials,
+        hpo_epochs=hpo_epochs,
+        hpo_fraction=hpo_fraction,
+        hpo_seed=hpo_seed,
+        resume=resume,
+    )
+    print(_sweep_summary(out["results"]))
+    return out
+
+
+def phase_promote(conditions: list[str], force_best: bool):
+    print("\n" + "█" * 60)
+    print("  PHASE 1C — PROMOTE PER-CONDITION SPECIALIST WINNERS")
+    print("█" * 60)
+    return promote(conditions, force_best=force_best)
 
 
 # ── Phase 2 (optional): HPO mini-runs ────────────────────────────────────────
@@ -273,8 +311,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--phase",
-        choices=["all", "normalize", "hpo", "train", "validate",
-                 "pseudo", "student", "export"],
+        choices=["all", "normalize", "hpo", "sweep", "promote", "train",
+                 "validate", "pseudo", "student", "export"],
         default="all",
     )
     parser.add_argument(
@@ -304,6 +342,14 @@ if __name__ == "__main__":
     parser.add_argument("--hpo-seed", type=int, default=42)
     parser.add_argument("--hpo-weight", default=None,
                         help="override base weight for HPO (sweep architectures)")
+    # Sweep / promote
+    parser.add_argument("--archs", nargs="+", default=ULTRALYTICS_ARCHS,
+                        help=f"architectures to sweep (default: {ULTRALYTICS_ARCHS})")
+    parser.add_argument("--skip-hpo", action="store_true",
+                        help="skip HPO mini-runs inside the sweep")
+    parser.add_argument("--force-best", action="store_true",
+                        help="promote highest-mAP even if no candidate "
+                             "passes the KPI gate (smoke-test only)")
     # Export / benchmark
     parser.add_argument("--target", choices=["specialists", "student", "all"],
                         default="all", help="export/benchmark target")
@@ -331,6 +377,18 @@ if __name__ == "__main__":
                 seed=args.hpo_seed,
                 weight_override=args.hpo_weight,
             )
+        elif phase == "sweep":
+            phase_sweep(
+                args.archs, args.conditions,
+                skip_hpo=args.skip_hpo,
+                hpo_trials=args.hpo_trials,
+                hpo_epochs=args.hpo_epochs,
+                hpo_fraction=args.hpo_fraction,
+                hpo_seed=args.hpo_seed,
+                resume=args.resume,
+            )
+        elif phase == "promote":
+            phase_promote(args.conditions, force_best=args.force_best)
         elif phase == "train":
             phase_train(args.conditions, args.resume)
         elif phase == "validate":

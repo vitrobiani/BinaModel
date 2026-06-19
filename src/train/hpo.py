@@ -18,7 +18,7 @@ to rank LR/wd choices by initial-trajectory quality, not to converge.
 Usage:
   python src/train/hpo.py --condition caries
   python src/train/hpo.py --condition all --n-trials 30 --epochs 10
-  python src/train/hpo.py --condition recession --weight yolo11s.pt
+  python src/train/hpo.py --condition recession --weight yolo26s.pt
 """
 from __future__ import annotations
 
@@ -34,6 +34,8 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+
+from train.train_specialist import hpo_best_json, hpo_project_dir  # noqa: E402
 
 PIPELINE_CFG = ROOT / "configs" / "pipeline.yaml"
 CONDITIONS = ["caries", "gingivitis", "plaque", "discoloration", "ulcer", "recession"]
@@ -150,21 +152,34 @@ def run_hpo(
     fraction: float = 0.10,
     seed: int = 42,
     weight_override: str | None = None,
+    arch: str | None = None,
 ) -> dict:
+    """Run HPO mini-runs for one (arch, condition).
+
+    arch=None → writes runs/hpo/<cond>_best.json (legacy single-arch behavior).
+    arch=<slug> → writes runs/hpo/<arch>/<cond>_best.json so each architecture
+    has its own HPO results and they don't fight each other.
+
+    If `arch` is set and `weight_override` isn't, the base weight defaults to
+    f"{arch}.pt" — convenient for sweeps over yolo26s/yolo26x/rtdetr-l/etc.
+    """
     optuna = _import_optuna()
     cfg = yaml.safe_load(PIPELINE_CFG.read_text())
     spec = cfg["specialists"][condition]
-    weight = weight_override or spec["weight"]
+    weight = weight_override or (f"{arch}.pt" if arch else spec["weight"])
     device = str(cfg["project"].get("device", "0"))
 
-    print(f"\n  HPO[{condition}] base={weight} trials={n_trials} epochs={epochs}")
+    arch_tag = f" arch={arch}" if arch else ""
+    print(f"\n  HPO[{condition}]{arch_tag} base={weight} "
+          f"trials={n_trials} epochs={epochs}")
     subset_yaml = make_subset(condition, fraction=fraction, seed=seed)
-    project = ROOT / "runs" / "hpo" / condition
+    project = hpo_project_dir(arch) / condition
     project.mkdir(parents=True, exist_ok=True)
 
     sampler = optuna.samplers.RandomSampler(seed=seed)
+    study_name = f"hpo_{arch}_{condition}" if arch else f"hpo_{condition}"
     study = optuna.create_study(
-        direction="maximize", sampler=sampler, study_name=f"hpo_{condition}",
+        direction="maximize", sampler=sampler, study_name=study_name,
     )
 
     def objective(trial):
@@ -186,6 +201,7 @@ def run_hpo(
 
     summary = {
         "condition": condition,
+        "arch": arch,
         "base_weight": weight,
         "n_trials": n_trials,
         "epochs_per_trial": epochs,
@@ -193,7 +209,7 @@ def run_hpo(
         "top3": top3,
         "best": top3[0] if top3 else None,
     }
-    out_path = ROOT / "runs" / "hpo" / f"{condition}_best.json"
+    out_path = hpo_best_json(condition, arch)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(summary, indent=2))
     print(f"  → {out_path}")
@@ -214,9 +230,14 @@ if __name__ == "__main__":
                         help="subset fraction (plan §5.1: 0.10)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--weight", default=None,
-                        help="override base weight (e.g. yolo11x.pt, "
+                        help="override base weight (e.g. yolo26x.pt, "
                              "rtdetr-l.pt) for sweeping multiple specialist "
                              "architectures")
+    parser.add_argument("--arch", default=None,
+                        help="sweep architecture slug; results land under "
+                             "runs/hpo/<arch>/<cond>_best.json. When set "
+                             "without --weight, base weight defaults to "
+                             "f'{arch}.pt'.")
     args = parser.parse_args()
 
     targets = CONDITIONS if args.condition == "all" else [args.condition]
@@ -228,4 +249,5 @@ if __name__ == "__main__":
             fraction=args.fraction,
             seed=args.seed,
             weight_override=args.weight,
+            arch=args.arch,
         )

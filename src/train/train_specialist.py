@@ -41,11 +41,44 @@ def load_pipeline_cfg():
         return yaml.safe_load(f)
 
 
-def _maybe_apply_hpo_overrides(condition: str, train_args: dict) -> dict:
-    """If src/train/hpo.py has produced a top-3 file for this condition,
+# ── Arch-aware path conventions ─────────────────────────────────────────────
+# When `arch` is None we use the canonical "current winner" locations.
+# When `arch` is set (sweep mode), outputs are partitioned by architecture so
+# multiple candidates can train and be compared without clobbering each other.
+
+
+def specialist_project_dir(arch: str | None) -> Path:
+    """Where Ultralytics writes runs/<project>/<name>/."""
+    if arch:
+        return ROOT / "runs" / "sweep" / arch
+    return ROOT / "runs" / "specialists"
+
+
+def specialist_run_dir(condition: str, arch: str | None) -> Path:
+    return specialist_project_dir(arch) / f"specialist_{condition}"
+
+
+def hpo_best_json(condition: str, arch: str | None) -> Path:
+    """Per-condition HPO summary; arch-partitioned so a YOLO26x HPO doesn't
+    bias a YOLO26s training run."""
+    base = ROOT / "runs" / "hpo"
+    if arch:
+        return base / arch / f"{condition}_best.json"
+    return base / f"{condition}_best.json"
+
+
+def hpo_project_dir(arch: str | None) -> Path:
+    base = ROOT / "runs" / "hpo"
+    return base / arch if arch else base
+
+
+def _maybe_apply_hpo_overrides(
+    condition: str, train_args: dict, *, arch: str | None = None,
+) -> dict:
+    """If src/train/hpo.py has produced a top-3 file for (arch, condition),
     silently merge its #1 params into train_args. This is the 'dynamic, not
     hardcoded' HPO link per Generic_Traning_Plan §5.1."""
-    hpo_path = ROOT / "runs" / "hpo" / f"{condition}_best.json"
+    hpo_path = hpo_best_json(condition, arch)
     if not hpo_path.exists():
         return train_args
     try:
@@ -64,7 +97,26 @@ def _maybe_apply_hpo_overrides(condition: str, train_args: dict) -> dict:
     return train_args
 
 
-def train_specialist(condition: str, resume: bool = False, overrides: dict = {}):
+def train_specialist(
+    condition: str,
+    resume: bool = False,
+    overrides: dict = {},
+    *,
+    arch: str | None = None,
+    weight_override: str | None = None,
+):
+    """Train one specialist.
+
+    Args:
+      condition: caries|gingivitis|...
+      resume: resume from last.pt of the same (arch, condition) run.
+      overrides: explicit dict overrides for train_args (CLI flags).
+      arch: optional architecture slug (e.g. "yolo26s", "yolo26x", "rtdetr-l").
+        When set, the run lives under runs/sweep/<arch>/specialist_<cond>/
+        and is treated as one candidate in a multi-arch sweep.
+      weight_override: optional starting weight (defaults to spec["weight"]).
+        Typically pass `f"{arch}.pt"` in sweep mode.
+    """
     cfg = load_pipeline_cfg()
     spec = cfg["specialists"][condition]
     defaults = cfg["train"]
@@ -76,7 +128,7 @@ def train_specialist(condition: str, resume: bool = False, overrides: dict = {})
     # Merge: pipeline defaults → model-level overrides → HPO best → CLI overrides
     train_args = {**defaults}
     train_args.update(model_cfg.get("overrides", {}))
-    train_args = _maybe_apply_hpo_overrides(condition, train_args)
+    train_args = _maybe_apply_hpo_overrides(condition, train_args, arch=arch)
     train_args.update(overrides)
 
     # Resolve dataset yaml path (absolute)
@@ -86,13 +138,18 @@ def train_specialist(condition: str, resume: bool = False, overrides: dict = {})
 
     # Output dir
     run_name = f"specialist_{condition}"
-    project_dir = ROOT / "runs" / "specialists"
+    project_dir = specialist_project_dir(arch)
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    weight = weight_override or spec["weight"]
 
     print(f"\n{'='*60}")
-    print(f"  Training specialist: {condition.upper()}")
+    arch_tag = f" [arch={arch}]" if arch else ""
+    print(f"  Training specialist: {condition.upper()}{arch_tag}")
     print(f"  Dataset:  {data_yaml}")
-    print(f"  Weights:  {spec['weight']}")
+    print(f"  Weights:  {weight}")
     print(f"  Epochs:   {train_args.get('epochs', 80)}")
+    print(f"  Out:      {project_dir / run_name}")
     print(f"{'='*60}\n")
 
     if resume:
@@ -102,7 +159,7 @@ def train_specialist(condition: str, resume: bool = False, overrides: dict = {})
             resume = False
 
     model = YOLO(str(project_dir / run_name / "weights" / "last.pt")
-                 if resume else spec["weight"])
+                 if resume else weight)
 
     results = model.train(
         data=str(data_yaml),

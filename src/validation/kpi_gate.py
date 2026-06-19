@@ -35,6 +35,7 @@ from ultralytics import YOLO
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from train.train_specialist import specialist_run_dir  # noqa: E402
 from validation.threshold_finder import (  # noqa: E402
     collect_predictions,
     find_threshold,
@@ -49,9 +50,14 @@ TARGET_PRECISION = 0.95
 MIN_RECALL = 0.60
 
 
-def evaluate_specialist(condition: str) -> dict:
+def evaluate_specialist(condition: str, *, arch: str | None = None) -> dict:
+    """KPI gate for one (arch, condition) candidate.
+
+    arch=None evaluates the canonical specialist; arch="yolo26s" / ...
+    evaluates the corresponding sweep candidate.
+    """
     cfg = yaml.safe_load(PIPELINE_CFG.read_text())
-    run_dir = ROOT / "runs" / "specialists" / f"specialist_{condition}"
+    run_dir = specialist_run_dir(condition, arch)
     ckpt = run_dir / "weights" / "best.pt"
     if not ckpt.exists():
         raise FileNotFoundError(f"No checkpoint at {ckpt}")
@@ -121,7 +127,7 @@ def evaluate_specialist(condition: str) -> dict:
     rec_ok = test_recall >= MIN_RECALL
     passed = map_ok and prec_ok and rec_ok
 
-    return {
+    result = {
         "condition": condition,
         "passed": passed,
         "calibrated_conf": calibrated_conf,
@@ -140,6 +146,9 @@ def evaluate_specialist(condition: str) -> dict:
         },
         "threshold_report": th,
     }
+    if arch:
+        result["arch"] = arch
+    return result
 
 
 def _summarize(r: dict) -> str:
@@ -155,9 +164,9 @@ def _summarize(r: dict) -> str:
             f"(conf>={r['calibrated_conf']:.4f})")
 
 
-def write_manifest(condition: str, result: dict) -> Path:
-    out = (ROOT / "runs" / "specialists" / f"specialist_{condition}"
-           / "kpi_gate.json")
+def write_manifest(condition: str, result: dict, *, arch: str | None = None) -> Path:
+    out = specialist_run_dir(condition, arch) / "kpi_gate.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=2))
     return out
 
@@ -166,13 +175,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--condition", default="all",
                         choices=CONDITIONS + ["all"])
+    parser.add_argument("--arch", default=None,
+                        help="sweep-mode architecture slug "
+                             "(evaluates runs/sweep/<arch>/specialist_<cond>/)")
     args = parser.parse_args()
     targets = CONDITIONS if args.condition == "all" else [args.condition]
     for cond in targets:
-        print(f"\n[{cond}]")
+        print(f"\n[{cond}]" + (f" arch={args.arch}" if args.arch else ""))
         try:
-            r = evaluate_specialist(cond)
-            out = write_manifest(cond, r)
+            r = evaluate_specialist(cond, arch=args.arch)
+            out = write_manifest(cond, r, arch=args.arch)
             print(_summarize(r))
             print(f"  → {out}")
         except FileNotFoundError as e:

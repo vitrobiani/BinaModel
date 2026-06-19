@@ -53,4 +53,7 @@ Thumbs.db
 desktop.ini
 
 # ── Claude Code (user-specific only) ─────────────────────────
-.claude/settings.local.json
+.claude
+
+# ── md files
+*.md

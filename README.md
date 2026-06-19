@@ -29,7 +29,7 @@ BinaDatasets/ (7 source datasets)
      │
      ▼
 ┌──────────────────────────────────────────────────┐
-│  Student Model (YOLO11m, 6-class)                │
+│  Student Model (YOLO26m, 6-class)                │
 │  Real data (oversampled) + Pseudo labels         │
 └──────────────────────────────────────────────────┘
 ```

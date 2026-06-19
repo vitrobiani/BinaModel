@@ -2,7 +2,7 @@
 # Install: pip install -r requirements.txt
 
 # Core ML
-ultralytics>=8.3.0      # YOLO11 + training utilities
+ultralytics>=8.3.0      # YOLO26 + training utilities  (bump if YOLO26 unsupported)
 torch>=2.1.0
 torchvision>=0.16.0
 

@@ -33,6 +33,8 @@ from ultralytics import YOLO
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from train.train_specialist import specialist_run_dir  # noqa: E402
+
 PIPELINE_CFG = ROOT / "configs" / "pipeline.yaml"
 CONDITIONS = ["caries", "gingivitis", "plaque", "discoloration", "ulcer", "recession"]
 
@@ -240,10 +242,16 @@ def find_threshold(
 # ── Per-specialist driver ────────────────────────────────────────────────────
 
 
-def find_specialist_threshold(condition: str) -> dict:
+def find_specialist_threshold(condition: str, *, arch: str | None = None) -> dict:
+    """Calibrate the per-(arch, condition) confidence threshold.
+
+    arch=None operates on the canonical runs/specialists/specialist_<cond>/.
+    arch="yolo26s" / "rtdetr-l" / ... operates on the sweep candidate at
+    runs/sweep/<arch>/specialist_<cond>/.
+    """
     cfg = yaml.safe_load(PIPELINE_CFG.read_text())
-    ckpt = (ROOT / "runs" / "specialists" / f"specialist_{condition}"
-            / "weights" / "best.pt")
+    run_dir = specialist_run_dir(condition, arch)
+    ckpt = run_dir / "weights" / "best.pt"
     if not ckpt.exists():
         raise FileNotFoundError(f"No trained specialist at {ckpt}")
 
@@ -267,8 +275,10 @@ def find_specialist_threshold(condition: str) -> dict:
 
     result = find_threshold(pred_conf, pred_tp, total_gt)
     result["condition"] = condition
+    if arch:
+        result["arch"] = arch
 
-    out_path = ckpt.parent.parent / "threshold.json"
+    out_path = run_dir / "threshold.json"
     out_path.write_text(json.dumps(result, indent=2))
     print(f"  → {out_path}")
     return result
@@ -290,12 +300,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--condition", default="all",
                         choices=CONDITIONS + ["all"])
+    parser.add_argument("--arch", default=None,
+                        help="sweep-mode architecture slug "
+                             "(reads runs/sweep/<arch>/specialist_<cond>/)")
     args = parser.parse_args()
     targets = CONDITIONS if args.condition == "all" else [args.condition]
     for cond in targets:
         try:
-            print(f"\n[{cond}]")
-            r = find_specialist_threshold(cond)
+            print(f"\n[{cond}]" + (f" arch={args.arch}" if args.arch else ""))
+            r = find_specialist_threshold(cond, arch=args.arch)
             print(_summarize(cond, r))
         except FileNotFoundError as e:
             print(f"  skipped: {e}")
