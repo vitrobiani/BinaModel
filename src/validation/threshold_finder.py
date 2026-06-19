@@ -28,12 +28,12 @@ from pathlib import Path
 
 import numpy as np
 import yaml
-from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from train.train_specialist import specialist_run_dir  # noqa: E402
+from train.train_specialist import specialist_run_dir, slug_from_weight  # noqa: E402
+from train.adapters import get_adapter  # noqa: E402
 
 PIPELINE_CFG = ROOT / "configs" / "pipeline.yaml"
 CONDITIONS = ["caries", "gingivitis", "plaque", "discoloration", "ulcer", "recession"]
@@ -92,58 +92,53 @@ def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def collect_predictions(
-    model: YOLO,
+    ckpt: Path,
     img_dir: Path,
     lbl_dir: Path,
     *,
+    arch: str,
     conf_min: float = 0.001,
-    iou_nms: float = 0.50,
     imgsz: int = 640,
     device: str = "0",
     batch: int = 16,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """
-    Run inference at a very low conf threshold and greedily IoU-match each
-    prediction against ground-truth boxes (highest-conf first, IoU>=IOU_MATCH).
+    Run inference at a very low conf via the per-arch adapter, then greedily
+    IoU-match each prediction against ground-truth (highest-conf first,
+    IoU>=IOU_MATCH). Family-agnostic — works for YOLO, RT-DETR, FRCNN, DETR.
 
     Returns:
       pred_conf: (K,) confidence per prediction (across the whole val set)
       pred_tp:   (K,) 1 if matched a GT (TP), else 0 (FP)
       total_gt:  total GT box count
     """
-    imgs = sorted([f for f in img_dir.iterdir()
-                   if f.suffix.lower() in {".jpg", ".jpeg", ".png"}])
+    adapter = get_adapter(arch)
+    img_paths = sorted([f for f in img_dir.iterdir()
+                        if f.suffix.lower() in {".jpg", ".jpeg", ".png"}])
+
+    predictions = adapter.predict_batch(
+        ckpt, img_paths,
+        conf_min=conf_min,
+        imgsz=imgsz,
+        batch=batch,
+        device=device,
+    )
+
     confidences: list[float] = []
     tps: list[int] = []
     total_gt = 0
 
-    results = model.predict(
-        source=[str(p) for p in imgs],
-        conf=conf_min,
-        iou=iou_nms,
-        imgsz=imgsz,
-        device=device,
-        batch=batch,
-        verbose=False,
-        stream=False,
-    )
-
-    for img_path, res in zip(imgs, results):
+    for img_path, pred in zip(img_paths, predictions):
         gt = _load_yolo_labels(lbl_dir / f"{img_path.stem}.txt")
         total_gt += len(gt)
         gt_xyxy = _cxcywh_to_xyxy(gt)
 
-        if res.boxes is None or len(res.boxes) == 0:
+        if len(pred.boxes_xyxyn) == 0:
             continue
 
-        # Ultralytics returns normalized cxcywh via `.xywhn`.
-        boxes_xywhn = res.boxes.xywhn.cpu().numpy()
-        pred_xyxy = _cxcywh_to_xyxy(boxes_xywhn)
-        pred_conf = res.boxes.conf.cpu().numpy()
-
-        order = np.argsort(-pred_conf)
-        pred_xyxy = pred_xyxy[order]
-        pred_conf = pred_conf[order]
+        order = np.argsort(-pred.scores)
+        pred_xyxy = pred.boxes_xyxyn[order]
+        pred_conf = pred.scores[order]
 
         if len(gt_xyxy) == 0:
             for c in pred_conf:
@@ -245,15 +240,21 @@ def find_threshold(
 def find_specialist_threshold(condition: str, *, arch: str | None = None) -> dict:
     """Calibrate the per-(arch, condition) confidence threshold.
 
-    arch=None operates on the canonical runs/specialists/specialist_<cond>/.
-    arch="yolo26s" / "rtdetr-l" / ... operates on the sweep candidate at
-    runs/sweep/<arch>/specialist_<cond>/.
+    arch=None operates on the canonical runs/specialists/specialist_<cond>/
+    (and derives the effective arch from pipeline.yaml's spec["weight"]).
+    arch="yolo26s" / "rtdetr-l" / "frcnn-r50" / "detr-r50" / ... operates on
+    the sweep candidate at runs/sweep/<arch>/specialist_<cond>/.
     """
     cfg = yaml.safe_load(PIPELINE_CFG.read_text())
     run_dir = specialist_run_dir(condition, arch)
     ckpt = run_dir / "weights" / "best.pt"
     if not ckpt.exists():
         raise FileNotFoundError(f"No trained specialist at {ckpt}")
+
+    # Derive effective arch (for adapter dispatch) when caller didn't pass one.
+    effective_arch = arch or slug_from_weight(
+        cfg["specialists"][condition]["weight"]
+    )
 
     data_yaml_path = ROOT / "data" / "processed" / condition / "dataset.yaml"
     data_yaml = yaml.safe_load(data_yaml_path.read_text())
@@ -264,10 +265,11 @@ def find_specialist_threshold(condition: str, *, arch: str | None = None) -> dic
 
     print(f"  ckpt:  {ckpt}")
     print(f"  val:   {val_img}")
+    print(f"  arch:  {effective_arch}")
 
-    model = YOLO(str(ckpt))
     pred_conf, pred_tp, total_gt = collect_predictions(
-        model, val_img, val_lbl,
+        ckpt, val_img, val_lbl,
+        arch=effective_arch,
         device=str(cfg["project"].get("device", "0")),
         imgsz=int(cfg["train"].get("imgsz", 640)),
         batch=int(cfg["train"].get("batch", 16)),

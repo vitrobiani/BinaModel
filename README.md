@@ -42,6 +42,7 @@ BinaDatasets/ (7 source datasets)
 - [Quick Start](#quick-start)
 - [Datasets](#datasets)
 - [Running the Pipeline](#running-the-pipeline)
+- [Specialist Architecture Sweep](#specialist-architecture-sweep)
 - [Analyzing Images](#analyzing-images)
 - [Adding New Data](#adding-new-data)
 - [Model Checkpoints](#model-checkpoints)
@@ -170,6 +171,52 @@ python src/pipeline.py --phase train --conditions caries gingivitis
 # Resume interrupted training
 python src/pipeline.py --phase train --resume
 ```
+
+---
+
+## Specialist Architecture Sweep
+
+Phase 1 of the multi-model training plan picks the best specialist architecture
+per condition by running every candidate through the same HPO → train →
+threshold → KPI gate pipeline. Five architectures are wired up:
+
+| Slug | Family | Adapter | Notes |
+|---|---|---|---|
+| `yolo26s` | Ultralytics YOLO | `UltralyticsAdapter` | Baseline (current default). |
+| `yolo26x` | Ultralytics YOLO | `UltralyticsAdapter` | Heavy YOLO sanity-check. |
+| `rtdetr-l` | Ultralytics RT-DETR | `UltralyticsAdapter` | Transformer real-time. |
+| `frcnn-r50` | torchvision | `FasterRCNNAdapter` | Faster R-CNN ResNet-50-FPN (plan §2.1). |
+| `detr-r50` | HuggingFace transformers | `DETRAdapter` | Pure transformer. Auto-skipped on conditions with <1000 train images (currently discoloration and ulcer). |
+
+### Sweep flow
+
+```bash
+# Full 5-arch × 6-condition sweep (HEAVY — multi-day on a single GPU)
+python src/pipeline.py --phase sweep
+
+# Restrict scope (recommended first run)
+python src/pipeline.py --phase sweep --archs yolo26s --conditions recession \
+                                    --hpo-trials 3 --hpo-epochs 3
+
+# After the sweep, pick the per-condition winner (must clear KPI gate)
+python src/pipeline.py --phase promote
+
+# Downstream phases then read winners from runs/specialists/specialist_<c>/
+python src/pipeline.py --phase pseudo
+python src/pipeline.py --phase student
+python src/pipeline.py --phase export
+```
+
+Each candidate's artifacts live under `runs/sweep/<arch>/specialist_<cond>/`
+(`weights/best.pt`, `threshold.json`, `kpi_gate.json`). The sweep writes
+`runs/sweep/results.json` incrementally after every pair, so the run is
+safely interruptible. `promote.py` reads that file, picks the highest-mAP@0.5
+candidate per condition that passed the KPI gate, and copies its files into
+the canonical `runs/specialists/specialist_<cond>/` location.
+
+Per-arch HPO results live under `runs/hpo/<arch>/<cond>_best.json` and are
+picked up automatically by `train_specialist` for the matching `(arch, cond)`
+run.
 
 ---
 

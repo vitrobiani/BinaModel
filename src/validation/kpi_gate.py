@@ -30,12 +30,12 @@ import sys
 from pathlib import Path
 
 import yaml
-from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from train.train_specialist import specialist_run_dir  # noqa: E402
+from train.train_specialist import specialist_run_dir, slug_from_weight  # noqa: E402
+from train.adapters import get_adapter  # noqa: E402
 from validation.threshold_finder import (  # noqa: E402
     collect_predictions,
     find_threshold,
@@ -93,25 +93,25 @@ def evaluate_specialist(condition: str, *, arch: str | None = None) -> dict:
             "threshold_report": th,
         }
 
-    model = YOLO(str(ckpt))
+    effective_arch = arch or slug_from_weight(
+        cfg["specialists"][condition]["weight"]
+    )
+    adapter = get_adapter(effective_arch)
 
-    # mAP@0.5 on the test split via ultralytics' native validator.
+    print(f"  arch:  {effective_arch}")
     print(f"  Evaluating mAP@0.5 on test ({test_img})...")
-    val_results = model.val(
-        data=str(data_yaml_path),
-        split="test",
-        device=str(cfg["project"].get("device", "0")),
+    map50 = adapter.compute_map50(
+        ckpt, data_yaml_path, split="test",
         imgsz=int(cfg["train"].get("imgsz", 640)),
         batch=int(cfg["train"].get("batch", 16)),
-        verbose=False,
+        device=str(cfg["project"].get("device", "0")),
     )
-    # Single-class: take overall mAP50.
-    map50 = float(getattr(val_results.box, "map50", 0.0))
 
     # Precision/recall at the val-calibrated threshold, computed on test.
     print(f"  Computing P/R at calibrated conf>={calibrated_conf:.4f} on test...")
     pred_conf, pred_tp, total_gt = collect_predictions(
-        model, test_img, test_lbl,
+        ckpt, test_img, test_lbl,
+        arch=effective_arch,
         device=str(cfg["project"].get("device", "0")),
         imgsz=int(cfg["train"].get("imgsz", 640)),
         batch=int(cfg["train"].get("batch", 16)),

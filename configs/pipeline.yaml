@@ -87,14 +87,22 @@ kpi_gate:
   precision_min:  0.95   # at the val-calibrated threshold
   recall_min:     0.60   # at the same threshold
 
-# ── Phase 1A specialist arch sweep (Ultralytics-compatible) ──
-# These slugs are passed to sweep.py / hpo.py; the weight file is f"{slug}.pt"
-# and is auto-downloaded by Ultralytics on first use. Phase 1B (Faster R-CNN,
-# DETR) will be added in a separate config block once those adapters land.
+# ── Phase 1 specialist arch sweep ────────────────────────────
+# These slugs are passed to sweep.py / hpo.py. For Ultralytics slugs the
+# weight file is f"{slug}.pt" and is auto-downloaded on first use; for
+# frcnn-r50 the torchvision adapter loads COCO-pretrained ResNet-50-FPN;
+# for detr-r50 the HF adapter loads "facebook/detr-resnet-50".
+#
+# DETR is auto-skipped for conditions with <1000 train images (currently
+# discoloration and ulcer) — see src/train/adapters/hf_detr_adapter.py.
 specialist_archs:
-  - yolo26s            # current baseline, direct YOLO11s migration
+  # Phase 1A — Ultralytics-API compatible
+  - yolo26s            # baseline, direct YOLO11s migration
   - yolo26x            # heavy YOLO sanity-check on capacity ceiling
   - rtdetr-l           # transformer real-time detector
+  # Phase 1B — torchvision + HuggingFace adapters
+  - frcnn-r50          # Faster R-CNN ResNet-50-FPN (plan §2.1 reference)
+  - detr-r50           # DETR-R50 transformer (auto-skipped on small data)
 
 # ── HPO (plan §5.1) — Optuna mini-run defaults ───────────────
 # These are search-space bounds and budget hints; the runner overrides via CLI.

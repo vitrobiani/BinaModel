@@ -53,11 +53,19 @@ from validation.kpi_gate import evaluate_specialist, write_manifest  # noqa: E40
 PIPELINE_CFG = ROOT / "configs" / "pipeline.yaml"
 RESULTS_JSON = ROOT / "runs" / "sweep" / "results.json"
 
-# Phase 1A: Ultralytics-API compatible heavy backbones (plan §2.1).
-# Phase 1B will add Faster R-CNN (torchvision) and DETR (HF transformers).
+# Phase 1A — Ultralytics-API compatible heavy backbones (plan §2.1).
 ULTRALYTICS_ARCHS = ["yolo26s", "yolo26x", "rtdetr-l"]
+# Phase 1B — torchvision + HuggingFace adapters (Faster R-CNN, DETR).
+EXTENDED_ARCHS = ["frcnn-r50", "detr-r50"]
+ALL_ARCHS = ULTRALYTICS_ARCHS + EXTENDED_ARCHS
 
 CONDITIONS = ["caries", "gingivitis", "plaque", "discoloration", "ulcer", "recession"]
+
+
+def _is_skip_architecture(exc: BaseException) -> bool:
+    """Detect SkipArchitecture without importing it eagerly (it lives in the
+    HF DETR adapter, which we don't want to import unless DETR is used)."""
+    return type(exc).__name__ == "SkipArchitecture"
 
 
 # ── Per-pair execution ──────────────────────────────────────────────────────
@@ -112,6 +120,13 @@ def sweep_one(
         result["ckpt"] = str(ckpt)
         result["train"] = "ok"
     except Exception as e:  # noqa: BLE001
+        if _is_skip_architecture(e):
+            # Adapter declined this (arch, cond) pair (e.g. DETR + small dataset).
+            print(f"  SKIP: {e}")
+            result["train"] = "skipped"
+            result["skip_reason"] = str(e)
+            result["elapsed_min"] = (time.time() - t0) / 60
+            return result
         print(f"  train failed: {e!r}")
         result["train"] = "failed"
         result["train_error"] = repr(e)
@@ -219,10 +234,14 @@ def _summary_table(results: list[dict]) -> str:
         h = (r.get("hpo") or "?")[:6].ljust(4)
         t = (r.get("train") or "?")[:6].ljust(5)
         th = (r.get("threshold") or "?")[:4].ljust(3)
-        kpi_verdict = (
-            "PASS" if r.get("kpi_passed")
-            else ("FAIL" if r.get("kpi") == "ok" else "·")
-        )
+        if r.get("train") == "skipped":
+            kpi_verdict = "SKIP"
+        elif r.get("kpi_passed"):
+            kpi_verdict = "PASS"
+        elif r.get("kpi") == "ok":
+            kpi_verdict = "FAIL"
+        else:
+            kpi_verdict = "·"
         m = r.get("metrics") or {}
         map50 = f"{m.get('mAP50', 0):.3f}" if m else "  -  "
         p = f"{m.get('test_precision', 0):.3f}" if m else "  -  "
@@ -236,9 +255,8 @@ def _summary_table(results: list[dict]) -> str:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--archs", nargs="+", default=ULTRALYTICS_ARCHS,
-                        help="architecture slugs to sweep "
-                             f"(default: {ULTRALYTICS_ARCHS})")
+    parser.add_argument("--archs", nargs="+", default=ALL_ARCHS,
+                        help=f"architecture slugs to sweep (default: {ALL_ARCHS})")
     parser.add_argument("--conditions", nargs="+", default=CONDITIONS,
                         choices=CONDITIONS,
                         help="conditions to sweep (default: all 6)")

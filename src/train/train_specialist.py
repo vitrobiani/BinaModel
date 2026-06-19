@@ -24,7 +24,6 @@ import sys
 from pathlib import Path
 
 import yaml
-from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -97,6 +96,12 @@ def _maybe_apply_hpo_overrides(
     return train_args
 
 
+def slug_from_weight(weight: str) -> str:
+    """Derive an architecture slug from a weight filename.
+    'yolo26s.pt' → 'yolo26s'; 'rtdetr-l.pt' → 'rtdetr-l'."""
+    return Path(weight).stem
+
+
 def train_specialist(
     condition: str,
     resume: bool = False,
@@ -105,18 +110,26 @@ def train_specialist(
     arch: str | None = None,
     weight_override: str | None = None,
 ):
-    """Train one specialist.
+    """Train one specialist via the architecture-appropriate adapter.
+
+    Dispatches every architecture (YOLO/RT-DETR via Ultralytics, Faster R-CNN
+    via torchvision, DETR via HuggingFace) through a common SpecialistAdapter
+    interface (src/train/adapters/). When `arch` is unset we derive it from
+    the configured weight name (e.g. "yolo26s.pt" → "yolo26s").
 
     Args:
       condition: caries|gingivitis|...
       resume: resume from last.pt of the same (arch, condition) run.
       overrides: explicit dict overrides for train_args (CLI flags).
-      arch: optional architecture slug (e.g. "yolo26s", "yolo26x", "rtdetr-l").
-        When set, the run lives under runs/sweep/<arch>/specialist_<cond>/
-        and is treated as one candidate in a multi-arch sweep.
+      arch: optional architecture slug. When set, output goes to
+        runs/sweep/<arch>/specialist_<cond>/. When None, output goes to
+        runs/specialists/specialist_<cond>/ and `arch` is derived from
+        spec["weight"] for HPO lookup purposes.
       weight_override: optional starting weight (defaults to spec["weight"]).
         Typically pass `f"{arch}.pt"` in sweep mode.
     """
+    from train.adapters import get_adapter  # lazy import; avoids cycles
+
     cfg = load_pipeline_cfg()
     spec = cfg["specialists"][condition]
     defaults = cfg["train"]
@@ -131,75 +144,38 @@ def train_specialist(
     train_args = _maybe_apply_hpo_overrides(condition, train_args, arch=arch)
     train_args.update(overrides)
 
-    # Resolve dataset yaml path (absolute)
+    # Make sure dataset.yaml exists (used by Ultralytics-family adapters).
     data_yaml = ROOT / "data" / "processed" / condition / "dataset.yaml"
     if not data_yaml.exists():
         _write_dataset_yaml(condition, model_cfg)
 
-    # Output dir
-    run_name = f"specialist_{condition}"
-    project_dir = specialist_project_dir(arch)
-    project_dir.mkdir(parents=True, exist_ok=True)
-
     weight = weight_override or spec["weight"]
+    effective_arch = arch or slug_from_weight(weight)
+
+    # Output dir (canonical vs sweep candidate).
+    output_dir = specialist_run_dir(condition, arch)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
-    arch_tag = f" [arch={arch}]" if arch else ""
+    arch_tag = f" [arch={arch}]" if arch else f" [arch={effective_arch}]"
     print(f"  Training specialist: {condition.upper()}{arch_tag}")
     print(f"  Dataset:  {data_yaml}")
     print(f"  Weights:  {weight}")
     print(f"  Epochs:   {train_args.get('epochs', 80)}")
-    print(f"  Out:      {project_dir / run_name}")
+    print(f"  Out:      {output_dir}")
     print(f"{'='*60}\n")
 
-    if resume:
-        last_ckpt = project_dir / run_name / "weights" / "last.pt"
-        if not last_ckpt.exists():
-            print(f"  [warn] No checkpoint to resume at {last_ckpt}, starting fresh.")
-            resume = False
-
-    model = YOLO(str(project_dir / run_name / "weights" / "last.pt")
-                 if resume else weight)
-
-    results = model.train(
-        data=str(data_yaml),
-        project=str(project_dir),
-        name=run_name,
-        exist_ok=True,
+    adapter = get_adapter(effective_arch)
+    best_ckpt = adapter.train(
+        condition=condition,
+        train_args=train_args,
+        output_dir=output_dir,
+        weight=weight,
         resume=resume,
-        device=cfg["project"]["device"],
-        # Core training params
-        epochs=train_args.get("epochs", 80),
-        imgsz=train_args.get("imgsz", 640),
-        batch=train_args.get("batch", 16),
-        optimizer=train_args.get("optimizer", "AdamW"),
-        lr0=train_args.get("lr0", 0.001),
-        lrf=train_args.get("lrf", 0.01),
-        momentum=train_args.get("momentum", 0.937),
-        weight_decay=train_args.get("weight_decay", 0.0005),
-        warmup_epochs=train_args.get("warmup_epochs", 3),
-        # Augmentation
-        hsv_h=train_args.get("hsv_h", 0.015),
-        hsv_s=train_args.get("hsv_s", 0.4),
-        hsv_v=train_args.get("hsv_v", 0.3),
-        fliplr=train_args.get("fliplr", 0.5),
-        flipud=train_args.get("flipud", 0.0),
-        degrees=train_args.get("degrees", 5.0),
-        translate=train_args.get("translate", 0.1),
-        scale=train_args.get("scale", 0.3),
-        mosaic=train_args.get("mosaic", 0.5),
-        copy_paste=train_args.get("copy_paste", 0.0),
-        # Save
-        save=True,
-        save_period=10,       # checkpoint every 10 epochs
-        plots=True,
-        val=True,
+        device=str(cfg["project"]["device"]),
     )
-
-    best_ckpt = project_dir / run_name / "weights" / "best.pt"
-    print(f"\n✓ Specialist [{condition}] trained.")
+    print(f"\n✓ Specialist [{condition}]{arch_tag} trained.")
     print(f"  Best checkpoint: {best_ckpt}")
-    print(f"  mAP50: {results.results_dict.get('metrics/mAP50(B)', 'N/A')}")
     return best_ckpt
 
 

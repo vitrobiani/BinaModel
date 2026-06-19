@@ -19,6 +19,13 @@ roboflow>=1.1.0         # for downloading Roboflow datasets
 # Hyperparameter optimization (Phase 2 — mini-runs, plan §5.1)
 optuna>=3.5.0
 
+# Phase 1B — non-Ultralytics specialist adapters
+# torchvision already pinned above; covers Faster R-CNN ResNet-50-FPN.
+transformers>=4.40.0    # HuggingFace DETR-R50 ("facebook/detr-resnet-50")
+torchmetrics>=1.3.0     # mAP@0.5 evaluation for FRCNN + DETR
+timm>=0.9.0             # used by HF DETR backbone helpers
+Pillow>=10.0.0          # already above; required by DetrImageProcessor
+
 # Edge-export benchmarking (Phase 7 — plan §4.4 / §5.3)
 onnx>=1.15.0
 onnxruntime>=1.16.0     # use onnxruntime-gpu for CUDA benchmarking

@@ -47,7 +47,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from data.normalize import NORMALIZERS
 from train.train_specialist import train_specialist
 from train.hpo import run_hpo
-from train.sweep import run_sweep, ULTRALYTICS_ARCHS, _summary_table as _sweep_summary
+from train.sweep import run_sweep, ALL_ARCHS, _summary_table as _sweep_summary
 from train.promote import promote
 from inference.ensemble import load_specialists, run_ensemble
 from inference.merge import (
@@ -343,8 +343,8 @@ if __name__ == "__main__":
     parser.add_argument("--hpo-weight", default=None,
                         help="override base weight for HPO (sweep architectures)")
     # Sweep / promote
-    parser.add_argument("--archs", nargs="+", default=ULTRALYTICS_ARCHS,
-                        help=f"architectures to sweep (default: {ULTRALYTICS_ARCHS})")
+    parser.add_argument("--archs", nargs="+", default=ALL_ARCHS,
+                        help=f"architectures to sweep (default: {ALL_ARCHS})")
     parser.add_argument("--skip-hpo", action="store_true",
                         help="skip HPO mini-runs inside the sweep")
     parser.add_argument("--force-best", action="store_true",
