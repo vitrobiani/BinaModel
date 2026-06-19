@@ -79,6 +79,31 @@ unified_classes:
 # keep only the higher-confidence one.
 cross_model_iou_threshold: 0.60
 
+# ── KPI gate (plan §2.4) ──────────────────────────────────────
+# A specialist cannot be used for pseudo-labeling until it clears all three
+# on the held-out test set. Values track the plan; tune cautiously.
+kpi_gate:
+  map50_min:      0.85   # mAP@0.5 on test
+  precision_min:  0.95   # at the val-calibrated threshold
+  recall_min:     0.60   # at the same threshold
+
+# ── HPO (plan §5.1) — Optuna mini-run defaults ───────────────
+# These are search-space bounds and budget hints; the runner overrides via CLI.
+hpo:
+  fraction:       0.10   # subset size for mini-runs
+  epochs:         8      # epochs per trial (plan range: 5-10)
+  n_trials:       20     # random log-scale trials per condition
+  seed:           42
+  search_space:
+    lr0:          [1.0e-5, 1.0e-1]      # log-uniform
+    weight_decay: [1.0e-5, 1.0e-3]      # log-uniform
+    batch:        [16, 32, 64]          # categorical
+
+# ── Edge-export hardware gate (plan §4.4 / §5.3 milestone 3) ──
+edge_gate:
+  latency_p50_ms: 100    # <=100 ms ≈10 FPS minimum on target hardware
+  weights_mb:     30     # <=30 MB ONNX file size
+
 # ── Training (shared defaults, overridden per specialist) ────
 train:
   epochs:       80

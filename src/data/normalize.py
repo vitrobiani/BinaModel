@@ -21,6 +21,8 @@ import argparse
 import math
 import random
 import shutil
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -35,7 +37,8 @@ ROOT = Path(__file__).resolve().parents[2]
 BINA_DATASETS_DIR = ROOT / "BinaDatasets"
 OUT_DIR = ROOT / "data" / "processed"
 
-SPLITS = {"train": 0.75, "val": 0.15, "test": 0.10}
+# 70/15/15 stratified, per Generic_Traning_Plan §1.4.
+SPLITS = {"train": 0.70, "val": 0.15, "test": 0.15}
 
 # Dataset paths
 CARRIES_DATASET = BINA_DATASETS_DIR / "Carries_Dataset"
@@ -123,6 +126,8 @@ def copy_yolo_with_remap(
     remap: dict[int, int],
     label_glob: str = "*.txt",
     name_prefix: str = "",
+    source_name: str = "",
+    sources_map: Optional[dict[str, str]] = None,
 ) -> int:
     """
     Copy YOLO-format labels, remapping class IDs.
@@ -136,6 +141,10 @@ def copy_yolo_with_remap(
         label_glob: Glob pattern for label files
         name_prefix: Prefix prepended to output filenames to avoid collisions
             when merging multiple source datasets into one pool.
+        source_name: Logical name of the source dataset, recorded into
+            sources_map for stratified splitting downstream.
+        sources_map: If provided, this dict is populated as
+            {output_filename: source_name} for every image copied.
 
     Returns:
         Number of images copied
@@ -169,16 +178,19 @@ def copy_yolo_with_remap(
         # Find and copy image
         img_stem = lp.stem
         img_copied = False
+        copied_name = ""
         for ext in [".jpg", ".jpeg", ".png", ".JPG", ".PNG", ".JPEG"]:
             img_src = src_img_dir / (img_stem + ext)
             if img_src.exists():
-                out_name = f"{name_prefix}{img_src.name}"
-                shutil.copy(img_src, out_img_dir / out_name)
+                copied_name = f"{name_prefix}{img_src.name}"
+                shutil.copy(img_src, out_img_dir / copied_name)
                 img_copied = True
                 break
 
         if img_copied:
             (out_label_dir / f"{name_prefix}{lp.name}").write_text("\n".join(lines_out))
+            if sources_map is not None and source_name:
+                sources_map[copied_name] = source_name
             copied += 1
 
     return copied
@@ -191,6 +203,8 @@ def copy_polygon_to_bbox(
     out_img_dir: Path,
     remap: dict[int, int],
     name_prefix: str = "",
+    source_name: str = "",
+    sources_map: Optional[dict[str, str]] = None,
 ) -> int:
     """
     Convert YOLO polygon (segmentation) format to YOLO bbox, with class remapping.
@@ -200,6 +214,9 @@ def copy_polygon_to_bbox(
 
     name_prefix is prepended to output filenames so multiple source datasets
     can be merged into the same temp pool without collisions.
+
+    sources_map (if provided) is populated with {output_filename: source_name}
+    so the downstream splitter can stratify by source dataset.
     """
     labels = list(src_label_dir.glob("*.txt"))
     copied = 0
@@ -235,16 +252,19 @@ def copy_polygon_to_bbox(
         # Find and copy image
         img_stem = lp.stem
         img_copied = False
+        copied_name = ""
         for ext in [".jpg", ".jpeg", ".png", ".JPG", ".PNG", ".JPEG"]:
             img_src = src_img_dir / (img_stem + ext)
             if img_src.exists():
-                out_name = f"{name_prefix}{img_src.name}"
-                shutil.copy(img_src, out_img_dir / out_name)
+                copied_name = f"{name_prefix}{img_src.name}"
+                shutil.copy(img_src, out_img_dir / copied_name)
                 img_copied = True
                 break
 
         if img_copied:
             (out_label_dir / f"{name_prefix}{lp.name}").write_text("\n".join(lines_out))
+            if sources_map is not None and source_name:
+                sources_map[copied_name] = source_name
             copied += 1
 
     return copied
@@ -254,6 +274,8 @@ def process_mendeley_dataset(
     src_dir: Path,
     out_label_dir: Path,
     out_img_dir: Path,
+    source_name: str = "",
+    sources_map: Optional[dict[str, str]] = None,
 ) -> int:
     """
     Process mendeley plaque dataset with custom format.
@@ -261,6 +283,8 @@ def process_mendeley_dataset(
     Directory structure: data/labels/patientXXXX/*.txt
                         data/images/patientXXXX/*.jpg
     Format: plaque_flag cx cy w h tooth_id
+
+    sources_map (if provided) is populated with {output_filename: source_name}.
     """
     labels_dir = src_dir / "labels"
     images_dir = src_dir / "images"
@@ -287,16 +311,17 @@ def process_mendeley_dataset(
 
             # Find and copy image
             img_stem = lp.stem
-            img_copied = False
             for ext in [".jpg", ".jpeg", ".png", ".JPG"]:
                 img_src = patient_img_dir / (img_stem + ext)
                 if img_src.exists():
                     # Use patient_filename to avoid collisions
                     out_name = f"{patient_dir.name}_{img_stem}"
-                    shutil.copy(img_src, out_img_dir / f"{out_name}{ext}")
+                    copied_name = f"{out_name}{ext}"
+                    shutil.copy(img_src, out_img_dir / copied_name)
                     (out_label_dir / f"{out_name}.txt").write_text("\n".join(lines_out))
+                    if sources_map is not None and source_name:
+                        sources_map[copied_name] = source_name
                     copied += 1
-                    img_copied = True
                     break
 
     return copied
@@ -305,99 +330,180 @@ def process_mendeley_dataset(
 # ── Split and Dataset YAML Utilities ─────────────────────────────────────────
 
 
-def create_splits(
-    all_img_dir: Path,
-    all_lbl_dir: Path,
+# ── Source-aware stratified splitting (Generic_Traning_Plan §1.4) ────────────
+#
+# Rules:
+#   - A source with full native train/val/test splits is routed *directly* into
+#     our train/val/test (strict isolation: a source's test images can never
+#     appear in our train/val).
+#   - A source with partial or no native splits is pooled, then stratified-split
+#     70/15/15 *per source*. Stratification by source preserves each source's
+#     proportional representation in every output split.
+
+
+@dataclass
+class SourceSpec:
+    """One source-dataset → (one or more) split contribution."""
+    name: str                              # logical source name, used for stratification
+    src_img: Path
+    src_lbl: Path
+    remap: dict[int, int]
+    converter: str = "yolo"                # "yolo" | "polygon"
+    name_prefix: str = ""                  # output filename prefix (collision-safety)
+    native_split: Optional[str] = None     # if "train"/"val"/"test", route there directly
+
+
+@dataclass
+class MendeleySourceSpec:
+    """Mendeley plaque dataset (custom per-patient layout)."""
+    name: str
+    src_base: Path
+    native_split: Optional[str] = None     # Mendeley has no native splits → always pool
+
+
+def _run_source_copy(
+    spec: SourceSpec,
+    out_lbl_dir: Path,
+    out_img_dir: Path,
+    sources_map: Optional[dict[str, str]],
+) -> int:
+    if spec.converter == "polygon":
+        return copy_polygon_to_bbox(
+            spec.src_lbl, spec.src_img, out_lbl_dir, out_img_dir,
+            spec.remap, name_prefix=spec.name_prefix,
+            source_name=spec.name, sources_map=sources_map,
+        )
+    return copy_yolo_with_remap(
+        spec.src_lbl, spec.src_img, out_lbl_dir, out_img_dir,
+        spec.remap, name_prefix=spec.name_prefix,
+        source_name=spec.name, sources_map=sources_map,
+    )
+
+
+def _stratified_split_by_source(
+    pool_img: Path,
+    pool_lbl: Path,
     out_dir: Path,
+    sources_map: dict[str, str],
     seed: int = 42,
 ) -> dict[str, int]:
     """
-    Split images into train/val/test.
-
-    Args:
-        all_img_dir: Directory containing all images
-        all_lbl_dir: Directory containing all labels
-        out_dir: Base output directory (will create images/train etc.)
-        seed: Random seed for reproducibility
-
-    Returns:
-        Dict with counts per split
+    Group pool images by their source name and assign each group 70/15/15.
+    Guarantees each source contributes proportionally to train/val/test.
     """
-    random.seed(seed)
-
-    all_imgs = list(all_img_dir.glob("*.*"))
-    # Filter to only image files
-    all_imgs = [f for f in all_imgs if f.suffix.lower() in {".jpg", ".jpeg", ".png"}]
-    random.shuffle(all_imgs)
-
-    n = len(all_imgs)
-    n_train = math.floor(n * SPLITS["train"])
-    n_val = math.floor(n * SPLITS["val"])
-
-    splits_data = {
-        "train": all_imgs[:n_train],
-        "val": all_imgs[n_train : n_train + n_val],
-        "test": all_imgs[n_train + n_val :],
-    }
-
-    counts = {}
-    for split, imgs in splits_data.items():
-        img_out = out_dir / "images" / split
-        lbl_out = out_dir / "labels" / split
-        img_out.mkdir(parents=True, exist_ok=True)
-        lbl_out.mkdir(parents=True, exist_ok=True)
-
-        for img in imgs:
-            shutil.copy(img, img_out / img.name)
-            lbl = all_lbl_dir / (img.stem + ".txt")
-            if lbl.exists():
-                shutil.copy(lbl, lbl_out / lbl.name)
-
-        counts[split] = len(imgs)
-
-    return counts
-
-
-def preserve_splits_copy(
-    src_base: Path,
-    out_dir: Path,
-    splits_map: dict[str, tuple[Path, Path]],
-    remap: dict[int, int],
-    converter: str = "yolo",
-) -> dict[str, int]:
-    """
-    Copy data preserving existing train/val/test splits.
-
-    Args:
-        src_base: Source base directory
-        out_dir: Output base directory
-        splits_map: {split_name: (img_dir, lbl_dir)} relative to src_base
-        remap: Class ID remapping
-        converter: "yolo" for standard, "polygon" for polygon→bbox
-
-    Returns:
-        Dict with counts per split
-    """
-    counts = {}
-
-    for split, (img_rel, lbl_rel) in splits_map.items():
-        src_img = src_base / img_rel
-        src_lbl = src_base / lbl_rel
-
-        if not src_img.exists():
-            counts[split] = 0
+    rng = random.Random(seed)
+    by_source: dict[str, list[Path]] = defaultdict(list)
+    for img in pool_img.iterdir():
+        if img.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
             continue
+        src = sources_map.get(img.name, "_unknown")
+        by_source[src].append(img)
 
+    splits: dict[str, list[Path]] = {"train": [], "val": [], "test": []}
+    per_source_report: dict[str, dict[str, int]] = {}
+    for src, imgs in by_source.items():
+        rng.shuffle(imgs)
+        n = len(imgs)
+        n_train = math.floor(n * SPLITS["train"])
+        n_val = math.floor(n * SPLITS["val"])
+        splits["train"].extend(imgs[:n_train])
+        splits["val"].extend(imgs[n_train:n_train + n_val])
+        splits["test"].extend(imgs[n_train + n_val:])
+        per_source_report[src] = {
+            "train": n_train,
+            "val": n_val,
+            "test": n - n_train - n_val,
+        }
+
+    counts: dict[str, int] = {}
+    for split, imgs in splits.items():
         out_img = out_dir / "images" / split
         out_lbl = out_dir / "labels" / split
         out_img.mkdir(parents=True, exist_ok=True)
         out_lbl.mkdir(parents=True, exist_ok=True)
+        for img in imgs:
+            shutil.copy(img, out_img / img.name)
+            lbl = pool_lbl / f"{img.stem}.txt"
+            if lbl.exists():
+                shutil.copy(lbl, out_lbl / lbl.name)
+        counts[split] = len(imgs)
 
-        if converter == "polygon":
-            counts[split] = copy_polygon_to_bbox(src_lbl, src_img, out_lbl, out_img, remap)
+    for src, r in per_source_report.items():
+        print(f"      pool source {src}: train={r['train']} val={r['val']} test={r['test']}")
+    return counts
+
+
+def process_sources(
+    out_dir: Path,
+    sources: list[SourceSpec],
+    mendeley_sources: Optional[list[MendeleySourceSpec]] = None,
+    seed: int = 42,
+) -> dict[str, int]:
+    """
+    Materialize all sources under out_dir/{images,labels}/{train,val,test}.
+
+    Sources with `native_split` set are copied directly into that split.
+    Sources without are pooled then stratified-split (70/15/15) by source name.
+    """
+    pool_img = out_dir / "_pool" / "images"
+    pool_lbl = out_dir / "_pool" / "labels"
+    pool_img.mkdir(parents=True, exist_ok=True)
+    pool_lbl.mkdir(parents=True, exist_ok=True)
+
+    pool_sources_map: dict[str, str] = {}
+    counts: dict[str, int] = {"train": 0, "val": 0, "test": 0}
+
+    for spec in sources:
+        if not spec.src_img.exists() or not spec.src_lbl.exists():
+            print(f"    skip (missing on disk): {spec.name}")
+            continue
+        if spec.native_split:
+            assert spec.native_split in ("train", "val", "test")
+            out_img = out_dir / "images" / spec.native_split
+            out_lbl = out_dir / "labels" / spec.native_split
+            out_img.mkdir(parents=True, exist_ok=True)
+            out_lbl.mkdir(parents=True, exist_ok=True)
+            n = _run_source_copy(spec, out_lbl, out_img, sources_map=None)
+            counts[spec.native_split] += n
+            print(f"    {spec.name} → {spec.native_split} (native): {n}")
         else:
-            counts[split] = copy_yolo_with_remap(src_lbl, src_img, out_lbl, out_img, remap)
+            n = _run_source_copy(spec, pool_lbl, pool_img, sources_map=pool_sources_map)
+            print(f"    {spec.name} → pool: {n}")
 
+    if mendeley_sources:
+        for ms in mendeley_sources:
+            if not ms.src_base.exists():
+                print(f"    skip (missing): {ms.name}")
+                continue
+            if ms.native_split:
+                out_img = out_dir / "images" / ms.native_split
+                out_lbl = out_dir / "labels" / ms.native_split
+                out_img.mkdir(parents=True, exist_ok=True)
+                out_lbl.mkdir(parents=True, exist_ok=True)
+                n = process_mendeley_dataset(
+                    ms.src_base, out_lbl, out_img,
+                    source_name=ms.name, sources_map=None,
+                )
+                counts[ms.native_split] += n
+                print(f"    {ms.name} → {ms.native_split} (native): {n}")
+            else:
+                n = process_mendeley_dataset(
+                    ms.src_base, pool_lbl, pool_img,
+                    source_name=ms.name, sources_map=pool_sources_map,
+                )
+                print(f"    {ms.name} → pool: {n}")
+
+    pool_files = [f for f in pool_img.iterdir()
+                  if f.suffix.lower() in {".jpg", ".jpeg", ".png"}]
+    if pool_files:
+        print(f"  Stratified-split of pool ({len(pool_files)} imgs, by source)...")
+        pool_counts = _stratified_split_by_source(
+            pool_img, pool_lbl, out_dir, pool_sources_map, seed=seed,
+        )
+        for k, v in pool_counts.items():
+            counts[k] += v
+
+    shutil.rmtree(out_dir / "_pool", ignore_errors=True)
     return counts
 
 
@@ -525,327 +631,246 @@ def augment_small_dataset(
 def normalize_caries(domain_shift: bool = False) -> None:  # noqa: ARG001
     """
     Normalize caries datasets:
-    - Carries_Dataset (classes 0,1 → 0)
-    - Carries_abrasion (polygon, classes 3-8 → 0)
-    - extensive (class 0 → 0)
+    - Carries_Dataset (full native splits, classes 0,1 → 0)
+    - Carries_abrasion (partial native splits, polygon, classes 3-8 → 0) → pooled
+    - extensive (partial native splits, class 0 → 0) → pooled
     """
     condition = "caries"
     out = OUT_DIR / condition
     shutil.rmtree(out, ignore_errors=True)
 
-    # Temporary "all" directory for combining sources before split
-    img_all = out / "images" / "all"
-    lbl_all = out / "labels" / "all"
-    img_all.mkdir(parents=True, exist_ok=True)
-    lbl_all.mkdir(parents=True, exist_ok=True)
+    sources: list[SourceSpec] = []
 
-    total = 0
-
-    # Source 1: Carries_Dataset (has existing train/val/test splits)
-    print("  Processing Carries_Dataset...")
+    # Carries_Dataset has full train/valid/test → route directly (strict isolation).
     if CARRIES_DATASET.exists():
-        for split in ["train", "valid", "test"]:
-            src_img = CARRIES_DATASET / split / "images"
-            src_lbl = CARRIES_DATASET / split / "yolo"
-            if src_img.exists():
-                n = copy_yolo_with_remap(src_lbl, src_img, lbl_all, img_all, remap={0: 0, 1: 0})
-                total += n
-                print(f"    {split}: {n} images")
+        for native, our in (("train", "train"), ("valid", "val"), ("test", "test")):
+            sources.append(SourceSpec(
+                name="Carries_Dataset",
+                src_img=CARRIES_DATASET / native / "images",
+                src_lbl=CARRIES_DATASET / native / "yolo",
+                remap={0: 0, 1: 0},
+                native_split=our,
+            ))
 
-    # Source 2: Carries_abrasion (polygon format, classes 3-8 = caries)
-    print("  Processing Carries_abrasion (polygon→bbox)...")
+    # Carries_abrasion has only train+valid (no test) → pool for stratified split.
     if CARRIES_ABRASION.exists():
-        caries_classes = {3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0}
-        for split in ["train", "valid"]:
-            src_img = CARRIES_ABRASION / "images" / split
-            src_lbl = CARRIES_ABRASION / "labels" / split
-            if src_img.exists():
-                n = copy_polygon_to_bbox(src_lbl, src_img, lbl_all, img_all, remap=caries_classes)
-                total += n
-                print(f"    {split}: {n} images")
+        caries_remap = {3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0}
+        for native in ("train", "valid"):
+            sources.append(SourceSpec(
+                name="Carries_abrasion",
+                src_img=CARRIES_ABRASION / "images" / native,
+                src_lbl=CARRIES_ABRASION / "labels" / native,
+                remap=caries_remap,
+                converter="polygon",
+                name_prefix="abrasion_",
+                native_split=None,  # pooled
+            ))
 
-    # Source 3: extensive dataset (class 0 = caries)
-    print("  Processing extensive dataset (caries)...")
+    # extensive has only train+val (no test) → pool for stratified split.
     if EXTENSIVE_DATASET.exists():
-        for split in ["train", "val"]:
-            src_img = EXTENSIVE_DATASET / "images" / split
-            src_lbl = EXTENSIVE_DATASET / "labels" / split
-            if src_img.exists():
-                n = copy_yolo_with_remap(src_lbl, src_img, lbl_all, img_all, remap={0: 0})
-                total += n
-                print(f"    {split}: {n} images")
+        for native in ("train", "val"):
+            sources.append(SourceSpec(
+                name="extensive",
+                src_img=EXTENSIVE_DATASET / "images" / native,
+                src_lbl=EXTENSIVE_DATASET / "labels" / native,
+                remap={0: 0},
+                name_prefix="ext_",
+                native_split=None,  # pooled
+            ))
 
-    # Create splits from combined data
-    print("  Creating train/val/test splits...")
-    counts = create_splits(img_all, lbl_all, out)
-    print(f"    train={counts['train']} val={counts['val']} test={counts['test']}")
-
-    # Clean up temp directories
-    shutil.rmtree(img_all, ignore_errors=True)
-    shutil.rmtree(lbl_all, ignore_errors=True)
-
+    counts = process_sources(out, sources)
+    print(f"  Final: train={counts['train']} val={counts['val']} test={counts['test']}")
     write_dataset_yaml(out, condition)
-    print(f"  Total: {total} images → {sum(counts.values())} after dedup")
 
 
 def normalize_gingivitis(domain_shift: bool = False) -> None:  # noqa: ARG001
     """
     Normalize gingivitis datasets:
-    - Gingivites_Dataset (classes 3,4 → 0)
-    - extensive (class 3 → 0)
+    - Gingivites_Dataset (full native splits, classes 3,4 → 0)
+    - extensive (partial native splits, class 3 → 0) → pooled
     """
     condition = "gingivitis"
     out = OUT_DIR / condition
     shutil.rmtree(out, ignore_errors=True)
 
-    img_all = out / "images" / "all"
-    lbl_all = out / "labels" / "all"
-    img_all.mkdir(parents=True, exist_ok=True)
-    lbl_all.mkdir(parents=True, exist_ok=True)
+    sources: list[SourceSpec] = []
 
-    total = 0
-
-    # Source 1: Gingivites_Dataset (classes 3,4 → 0)
-    print("  Processing Gingivites_Dataset...")
+    # Gingivites has full Training/Validation/Test → route directly.
     if GINGIVITES_DATASET.exists():
-        gingivitis_remap = {3: 0, 4: 0}
-        for split_name, folder in [("train", "Training"), ("val", "Validation"), ("test", "Test")]:
-            src_img = GINGIVITES_DATASET / folder / "Images"
-            src_lbl = GINGIVITES_DATASET / folder / "Labels"
-            if src_img.exists():
-                n = copy_yolo_with_remap(src_lbl, src_img, lbl_all, img_all, remap=gingivitis_remap)
-                total += n
-                print(f"    {split_name}: {n} images")
+        for native, our in (("Training", "train"), ("Validation", "val"), ("Test", "test")):
+            sources.append(SourceSpec(
+                name="Gingivites_Dataset",
+                src_img=GINGIVITES_DATASET / native / "Images",
+                src_lbl=GINGIVITES_DATASET / native / "Labels",
+                remap={3: 0, 4: 0},
+                native_split=our,
+            ))
 
-    # Source 2: extensive dataset (class 3 = gingivitis)
-    print("  Processing extensive dataset (gingivitis)...")
+    # extensive: train+val only, no test → pool for stratified split.
     if EXTENSIVE_DATASET.exists():
-        for split in ["train", "val"]:
-            src_img = EXTENSIVE_DATASET / "images" / split
-            src_lbl = EXTENSIVE_DATASET / "labels" / split
-            if src_img.exists():
-                n = copy_yolo_with_remap(src_lbl, src_img, lbl_all, img_all, remap={3: 0})
-                total += n
-                print(f"    {split}: {n} images")
+        for native in ("train", "val"):
+            sources.append(SourceSpec(
+                name="extensive",
+                src_img=EXTENSIVE_DATASET / "images" / native,
+                src_lbl=EXTENSIVE_DATASET / "labels" / native,
+                remap={3: 0},
+                name_prefix="ext_",
+                native_split=None,
+            ))
 
-    # Create splits
-    print("  Creating train/val/test splits...")
-    counts = create_splits(img_all, lbl_all, out)
-    print(f"    train={counts['train']} val={counts['val']} test={counts['test']}")
-
-    shutil.rmtree(img_all, ignore_errors=True)
-    shutil.rmtree(lbl_all, ignore_errors=True)
-
+    counts = process_sources(out, sources)
+    print(f"  Final: train={counts['train']} val={counts['val']} test={counts['test']}")
     write_dataset_yaml(out, condition)
-    print(f"  Total: {total} images → {sum(counts.values())} after dedup")
 
 
 def normalize_plaque(domain_shift: bool = False) -> None:  # noqa: ARG001
     """
-    Normalize plaque datasets:
-    - mendeley-dataset (custom format: plaque_flag=1 → class 0)
-    - CALCULUS_Dataset (class 0 → 0)
+    Normalize plaque datasets (none have native test splits → all pooled):
+    - mendeley-dataset (custom per-patient layout, plaque_flag=1 → class 0)
+    - CALCULUS_Dataset (only train, class 0 → 0)
     """
     condition = "plaque"
     out = OUT_DIR / condition
     shutil.rmtree(out, ignore_errors=True)
 
-    img_all = out / "images" / "all"
-    lbl_all = out / "labels" / "all"
-    img_all.mkdir(parents=True, exist_ok=True)
-    lbl_all.mkdir(parents=True, exist_ok=True)
+    sources: list[SourceSpec] = []
+    mendeley_sources: list[MendeleySourceSpec] = []
 
-    total = 0
-
-    # Source 1: mendeley-dataset (custom plaque format)
-    print("  Processing mendeley-dataset...")
     if MENDELEY_DATASET.exists():
-        n = process_mendeley_dataset(MENDELEY_DATASET, lbl_all, img_all)
-        total += n
-        print(f"    Processed: {n} images with plaque")
+        mendeley_sources.append(MendeleySourceSpec(
+            name="mendeley", src_base=MENDELEY_DATASET, native_split=None,
+        ))
 
-    # Source 2: CALCULUS_Dataset
-    print("  Processing CALCULUS_Dataset...")
     if CALCULUS_DATASET.exists():
-        src_img = CALCULUS_DATASET / "train" / "images"
-        src_lbl = CALCULUS_DATASET / "train" / "labels"
-        if src_img.exists():
-            n = copy_yolo_with_remap(src_lbl, src_img, lbl_all, img_all, remap={0: 0})
-            total += n
-            print(f"    train: {n} images")
+        sources.append(SourceSpec(
+            name="CALCULUS_Dataset",
+            src_img=CALCULUS_DATASET / "train" / "images",
+            src_lbl=CALCULUS_DATASET / "train" / "labels",
+            remap={0: 0},
+            name_prefix="calc_",
+            native_split=None,
+        ))
 
-    # Create splits
-    print("  Creating train/val/test splits...")
-    counts = create_splits(img_all, lbl_all, out)
-    print(f"    train={counts['train']} val={counts['val']} test={counts['test']}")
-
-    shutil.rmtree(img_all, ignore_errors=True)
-    shutil.rmtree(lbl_all, ignore_errors=True)
-
+    counts = process_sources(out, sources, mendeley_sources=mendeley_sources)
+    print(f"  Final: train={counts['train']} val={counts['val']} test={counts['test']}")
     write_dataset_yaml(out, condition)
-    print(f"  Total: {total} images → {sum(counts.values())} after dedup")
 
 
 def normalize_discoloration(domain_shift: bool = False) -> None:  # noqa: ARG001
     """
     Normalize discoloration datasets:
-    - extensive (class 2 → 0)
+    - extensive (train+val, no native test, class 2 → 0) → pooled and stratified.
     """
     condition = "discoloration"
     out = OUT_DIR / condition
     shutil.rmtree(out, ignore_errors=True)
 
-    img_all = out / "images" / "all"
-    lbl_all = out / "labels" / "all"
-    img_all.mkdir(parents=True, exist_ok=True)
-    lbl_all.mkdir(parents=True, exist_ok=True)
-
-    total = 0
-
-    # Source: extensive dataset (class 2 = tooth discoloration)
-    print("  Processing extensive dataset (discoloration)...")
+    sources: list[SourceSpec] = []
     if EXTENSIVE_DATASET.exists():
-        for split in ["train", "val"]:
-            src_img = EXTENSIVE_DATASET / "images" / split
-            src_lbl = EXTENSIVE_DATASET / "labels" / split
-            if src_img.exists():
-                n = copy_yolo_with_remap(src_lbl, src_img, lbl_all, img_all, remap={2: 0})
-                total += n
-                print(f"    {split}: {n} images")
+        for native in ("train", "val"):
+            sources.append(SourceSpec(
+                name="extensive",
+                src_img=EXTENSIVE_DATASET / "images" / native,
+                src_lbl=EXTENSIVE_DATASET / "labels" / native,
+                remap={2: 0},
+                name_prefix="ext_",
+                native_split=None,
+            ))
 
-    # Create splits
-    print("  Creating train/val/test splits...")
-    counts = create_splits(img_all, lbl_all, out)
-    print(f"    train={counts['train']} val={counts['val']} test={counts['test']}")
-
-    shutil.rmtree(img_all, ignore_errors=True)
-    shutil.rmtree(lbl_all, ignore_errors=True)
-
+    counts = process_sources(out, sources)
+    print(f"  Final: train={counts['train']} val={counts['val']} test={counts['test']}")
     write_dataset_yaml(out, condition)
-    print(f"  Total: {total} images → {sum(counts.values())} after dedup")
 
 
 def normalize_ulcer(domain_shift: bool = False) -> None:  # noqa: ARG001
     """
     Normalize ulcer datasets:
-    - extensive (class 1 → 0)
+    - extensive (train+val, no native test, class 1 → 0) → pooled and stratified.
     """
     condition = "ulcer"
     out = OUT_DIR / condition
     shutil.rmtree(out, ignore_errors=True)
 
-    img_all = out / "images" / "all"
-    lbl_all = out / "labels" / "all"
-    img_all.mkdir(parents=True, exist_ok=True)
-    lbl_all.mkdir(parents=True, exist_ok=True)
-
-    total = 0
-
-    # Source: extensive dataset (class 1 = ulcer)
-    print("  Processing extensive dataset (ulcer)...")
+    sources: list[SourceSpec] = []
     if EXTENSIVE_DATASET.exists():
-        for split in ["train", "val"]:
-            src_img = EXTENSIVE_DATASET / "images" / split
-            src_lbl = EXTENSIVE_DATASET / "labels" / split
-            if src_img.exists():
-                n = copy_yolo_with_remap(src_lbl, src_img, lbl_all, img_all, remap={1: 0})
-                total += n
-                print(f"    {split}: {n} images")
+        for native in ("train", "val"):
+            sources.append(SourceSpec(
+                name="extensive",
+                src_img=EXTENSIVE_DATASET / "images" / native,
+                src_lbl=EXTENSIVE_DATASET / "labels" / native,
+                remap={1: 0},
+                name_prefix="ext_",
+                native_split=None,
+            ))
 
-    # Create splits
-    print("  Creating train/val/test splits...")
-    counts = create_splits(img_all, lbl_all, out)
-    print(f"    train={counts['train']} val={counts['val']} test={counts['test']}")
-
-    shutil.rmtree(img_all, ignore_errors=True)
-    shutil.rmtree(lbl_all, ignore_errors=True)
-
+    counts = process_sources(out, sources)
+    print(f"  Final: train={counts['train']} val={counts['val']} test={counts['test']}")
     write_dataset_yaml(out, condition)
-    print(f"  Total: {total} images → {sum(counts.values())} after dedup")
 
 
 def normalize_recession(domain_shift: bool = False) -> None:  # noqa: ARG001
     """
     Normalize recession datasets:
-    - gum_recession_dataset (class 0 → 0, ignore classes 1,2)
-    - Spot dataset (polygon, class 5 "Caries 5 class" → 0; other classes dropped)
-    - big_gum_dataset (bbox, class 1 "receding_gum" → 0; class 0 "diseased_gum" dropped)
-    - Apply heavy augmentation if train set is still small
+    - gum_recession_dataset (only train, class 0 → 0) → pooled
+    - Spot (full native splits, polygon, class 5 → 0; other classes dropped) → routed
+    - big_gum_dataset (full native splits, bbox, class 1 receding_gum → 0) → routed
+    - Augment train set only if it ends up under target_count.
     """
     condition = "recession"
     out = OUT_DIR / condition
     shutil.rmtree(out, ignore_errors=True)
 
-    # For recession, we'll create splits first, then augment train set
-    img_all = out / "images" / "all"
-    lbl_all = out / "labels" / "all"
-    img_all.mkdir(parents=True, exist_ok=True)
-    lbl_all.mkdir(parents=True, exist_ok=True)
+    sources: list[SourceSpec] = []
 
-    total = 0
-
-    # Source 1: gum_recession_dataset (class 0 = gum recession)
-    print("  Processing gum_recession_dataset...")
+    # gum_recession_dataset: train only, no native val/test → pool.
     if GUM_RECESSION.exists():
-        src_img = GUM_RECESSION / "train" / "images"
-        src_lbl = GUM_RECESSION / "train" / "labels"
-        if src_img.exists():
-            n = copy_yolo_with_remap(src_lbl, src_img, lbl_all, img_all, remap={0: 0})
-            total += n
-            print(f"    train: {n} images")
+        sources.append(SourceSpec(
+            name="gum_recession_dataset",
+            src_img=GUM_RECESSION / "train" / "images",
+            src_lbl=GUM_RECESSION / "train" / "labels",
+            remap={0: 0},
+            name_prefix="gum_",
+            native_split=None,
+        ))
 
-    # Source 2: Spot dataset (polygon segmentation, class 5 = "Caries 5 class")
-    # Spot annotates recession as "Caries 5 class". We keep only class 5 lines
-    # (images with no class 5 are dropped automatically by copy_polygon_to_bbox
-    # when lines_out is empty) and remap to 0 to match the recession specialist.
-    print("  Processing Spot dataset (class 5 → recession)...")
+    # Spot: full native train/valid/test → route directly.
     if SPOT_DATASET.exists():
-        for split in ["train", "valid", "test"]:
-            src_img = SPOT_DATASET / split / "images"
-            src_lbl = SPOT_DATASET / split / "labels"
-            if src_img.exists():
-                n = copy_polygon_to_bbox(
-                    src_lbl, src_img, lbl_all, img_all,
-                    remap={5: 0}, name_prefix="spot_",
-                )
-                total += n
-                print(f"    {split}: {n} images with class 5")
+        for native, our in (("train", "train"), ("valid", "val"), ("test", "test")):
+            sources.append(SourceSpec(
+                name="Spot",
+                src_img=SPOT_DATASET / native / "images",
+                src_lbl=SPOT_DATASET / native / "labels",
+                remap={5: 0},
+                converter="polygon",
+                name_prefix="spot_",
+                native_split=our,
+            ))
 
-    # Source 3: big_gum_dataset (bbox, class 1 = "receding_gum")
-    # data.yaml: names: ['diseased_gum', 'receding_gum'] → only class 1 is recession.
-    # Class 0 (diseased_gum) is dropped per-line; images with no class 1 are
-    # skipped automatically when lines_out is empty.
-    print("  Processing big_gum_dataset (class 1 receding_gum → recession)...")
+    # big_gum_dataset: full native train/valid/test → route directly.
     if BIG_GUM_DATASET.exists():
-        for split in ["train", "valid", "test"]:
-            src_img = BIG_GUM_DATASET / split / "images"
-            src_lbl = BIG_GUM_DATASET / split / "labels"
-            if src_img.exists():
-                n = copy_yolo_with_remap(
-                    src_lbl, src_img, lbl_all, img_all,
-                    remap={1: 0}, name_prefix="big_gum_",
-                )
-                total += n
-                print(f"    {split}: {n} images with receding_gum")
+        for native, our in (("train", "train"), ("valid", "val"), ("test", "test")):
+            sources.append(SourceSpec(
+                name="big_gum_dataset",
+                src_img=BIG_GUM_DATASET / native / "images",
+                src_lbl=BIG_GUM_DATASET / native / "labels",
+                remap={1: 0},
+                name_prefix="big_gum_",
+                native_split=our,
+            ))
 
-    # Create splits
-    print("  Creating train/val/test splits...")
-    counts = create_splits(img_all, lbl_all, out)
-    print(f"    train={counts['train']} val={counts['val']} test={counts['test']}")
+    counts = process_sources(out, sources)
+    print(f"  Final (pre-aug): train={counts['train']} val={counts['val']} test={counts['test']}")
 
-    shutil.rmtree(img_all, ignore_errors=True)
-    shutil.rmtree(lbl_all, ignore_errors=True)
-
-    # Augment train set
-    print("  Augmenting training set (target: 300 images)...")
+    # Augment train set only if still under target (with three sources merged
+    # it usually isn't, so this becomes a no-op for current data).
     train_img = out / "images" / "train"
     train_lbl = out / "labels" / "train"
-    augmented = augment_small_dataset(train_img, train_lbl, target_count=300)
-    print(f"    Created {augmented} augmented images")
+    if train_img.exists():
+        augmented = augment_small_dataset(train_img, train_lbl, target_count=300)
+        if augmented:
+            print(f"  Augmented +{augmented} train images")
 
     write_dataset_yaml(out, condition)
-    final_train = len(list(train_img.glob("*.*")))
-    print(f"  Total: {total} images → train={final_train} after augmentation")
 
 
 # ── Entry Point ──────────────────────────────────────────────────────────────

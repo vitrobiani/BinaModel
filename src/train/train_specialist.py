@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -31,10 +32,36 @@ sys.path.insert(0, str(ROOT))
 PIPELINE_CFG = ROOT / "configs" / "pipeline.yaml"
 CONDITIONS = ["caries", "gingivitis", "plaque", "discoloration", "ulcer", "recession"]
 
+# HPO param keys we accept from runs/hpo/<cond>_best.json
+HPO_OVERRIDABLE = ("lr0", "weight_decay", "batch")
+
 
 def load_pipeline_cfg():
     with open(PIPELINE_CFG) as f:
         return yaml.safe_load(f)
+
+
+def _maybe_apply_hpo_overrides(condition: str, train_args: dict) -> dict:
+    """If src/train/hpo.py has produced a top-3 file for this condition,
+    silently merge its #1 params into train_args. This is the 'dynamic, not
+    hardcoded' HPO link per Generic_Traning_Plan §5.1."""
+    hpo_path = ROOT / "runs" / "hpo" / f"{condition}_best.json"
+    if not hpo_path.exists():
+        return train_args
+    try:
+        hpo = json.loads(hpo_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return train_args
+    best = hpo.get("best")
+    if not best or not best.get("params"):
+        return train_args
+    params = best["params"]
+    applied = {k: params[k] for k in HPO_OVERRIDABLE if k in params}
+    if applied:
+        print(f"  ↻ HPO override (trial #{best.get('trial')} "
+              f"mAP50={best.get('map50', 0):.3f}): {applied}")
+        train_args.update(applied)
+    return train_args
 
 
 def train_specialist(condition: str, resume: bool = False, overrides: dict = {}):
@@ -46,9 +73,10 @@ def train_specialist(condition: str, resume: bool = False, overrides: dict = {})
     with open(model_cfg_path) as f:
         model_cfg = yaml.safe_load(f)
 
-    # Merge: pipeline defaults → model-level overrides → CLI overrides
+    # Merge: pipeline defaults → model-level overrides → HPO best → CLI overrides
     train_args = {**defaults}
     train_args.update(model_cfg.get("overrides", {}))
+    train_args = _maybe_apply_hpo_overrides(condition, train_args)
     train_args.update(overrides)
 
     # Resolve dataset yaml path (absolute)

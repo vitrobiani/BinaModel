@@ -3,27 +3,26 @@ src/pipeline.py
 ────────────────
 Top-level orchestrator for the full Bina training pipeline.
 
-Phases:
-  1. normalize  — convert raw datasets to YOLO format
-  2. train      — train 6 specialist models
-  3. pseudo     — run ensemble over unlabeled images, merge annotations
-  4. student    — train final multi-class model on real + pseudo data
+Phases (in canonical order):
+  1. normalize  — convert raw datasets to YOLO format (stratified 70/15/15)
+  2. hpo        — Optuna mini-runs to discover per-specialist hyperparams
+                  (writes runs/hpo/<cond>_best.json; auto-picked up by train)
+  3. train      — train 6 specialist models
+  4. validate   — PR-curve threshold calibration + KPI gate against test set
+                  (writes threshold.json + kpi_gate.json next to each ckpt)
+  5. pseudo     — ensemble inference over unlabeled images, merge annotations
+  6. student    — train final multi-class model on real + pseudo data
+  7. export     — ONNX export + latency benchmark (hardware viability gate)
+
+`--phase all` runs normalize → train → validate → pseudo → student → export.
+HPO is intentionally NOT in `all` because it's exploratory and slow; run it
+explicitly with `--phase hpo` when you want to refresh per-condition configs.
 
 Usage:
-  # Full end-to-end run
   python src/pipeline.py --phase all
-
-  # Individual phases
-  python src/pipeline.py --phase normalize
-  python src/pipeline.py --phase train
-  python src/pipeline.py --phase pseudo
-  python src/pipeline.py --phase student
-
-  # Skip to student using pre-existing pseudo labels
-  python src/pipeline.py --phase student
-
-  # Only pseudo-label with specific conditions' models
-  python src/pipeline.py --phase pseudo --conditions caries gingivitis
+  python src/pipeline.py --phase hpo --conditions recession
+  python src/pipeline.py --phase validate
+  python src/pipeline.py --phase export --target specialists
 """
 
 import argparse
@@ -39,12 +38,17 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from data.normalize import NORMALIZERS
 from train.train_specialist import train_specialist
+from train.hpo import run_hpo
 from inference.ensemble import load_specialists, run_ensemble
 from inference.merge import (
     merge_detections,
     write_student_dataset_yaml,
     print_merge_report,
 )
+from validation.threshold_finder import find_specialist_threshold, _summarize as _th_summary
+from validation.kpi_gate import evaluate_specialist, write_manifest as write_kpi_manifest, _summarize as _kpi_summary
+from export.onnx_export import export_all_specialists, export_student
+from export.latency_benchmark import benchmark_specialists, benchmark_student
 
 PIPELINE_CFG = ROOT / "configs" / "pipeline.yaml"
 CONDITIONS = ["caries", "gingivitis", "plaque", "discoloration", "ulcer", "recession"]
@@ -67,21 +71,74 @@ def phase_normalize(conditions: list[str], domain_shift: bool):
     print("\n✓ Phase 1 complete.")
 
 
-# ── Phase 2: Train specialists ───────────────────────────────────────────────
+# ── Phase 2 (optional): HPO mini-runs ────────────────────────────────────────
+
+def phase_hpo(conditions: list[str], n_trials: int, epochs: int,
+              fraction: float, seed: int, weight_override: str | None):
+    print("\n" + "█"*60)
+    print("  PHASE 2 — HPO MINI-RUNS  (Optuna, plan §5.1)")
+    print("█"*60)
+    print(f"  trials/cond={n_trials}  epochs/trial={epochs}  "
+          f"subset={int(fraction*100)}%  weight_override={weight_override or 'cfg default'}")
+    results = {}
+    for cond in conditions:
+        results[cond] = run_hpo(
+            cond, n_trials=n_trials, epochs=epochs,
+            fraction=fraction, seed=seed, weight_override=weight_override,
+        )
+    print("\n✓ Phase 2 (HPO) complete.")
+    return results
+
+
+# ── Phase 3: Train specialists ───────────────────────────────────────────────
 
 def phase_train(conditions: list[str], resume: bool):
     print("\n" + "█"*60)
-    print("  PHASE 2 — SPECIALIST MODEL TRAINING")
+    print("  PHASE 3 — SPECIALIST MODEL TRAINING")
     print("█"*60)
     checkpoints = {}
     for cond in conditions:
         ckpt = train_specialist(cond, resume=resume)
         checkpoints[cond] = ckpt
-    print(f"\n✓ Phase 2 complete. {len(checkpoints)} specialists trained.")
+    print(f"\n✓ Phase 3 complete. {len(checkpoints)} specialists trained.")
     return checkpoints
 
 
-# ── Phase 3: Pseudo-labeling ─────────────────────────────────────────────────
+# ── Phase 4: Validate (threshold finder + KPI gate) ──────────────────────────
+
+def phase_validate(conditions: list[str]):
+    print("\n" + "█"*60)
+    print("  PHASE 4 — VALIDATION (PR threshold + KPI gate, plan §2.4 / §3.3)")
+    print("█"*60)
+
+    print("\n  Step 1/2: per-specialist threshold calibration on val")
+    for cond in conditions:
+        try:
+            print(f"\n[{cond}]")
+            r = find_specialist_threshold(cond)
+            print(_th_summary(cond, r))
+        except FileNotFoundError as e:
+            print(f"  skipped: {e}")
+
+    print("\n  Step 2/2: KPI gate on test")
+    verdicts: dict[str, dict] = {}
+    for cond in conditions:
+        print(f"\n[{cond}]")
+        try:
+            r = evaluate_specialist(cond)
+            out = write_kpi_manifest(cond, r)
+            print(_kpi_summary(r))
+            print(f"  → {out}")
+            verdicts[cond] = r
+        except FileNotFoundError as e:
+            print(f"  skipped: {e}")
+
+    n_pass = sum(1 for r in verdicts.values() if r.get("passed"))
+    print(f"\n✓ Phase 4 complete. {n_pass}/{len(verdicts)} specialists passed KPI gate.")
+    return verdicts
+
+
+# ── Phase 5: Pseudo-labeling ─────────────────────────────────────────────────
 
 def phase_pseudo(conditions: list[str]):
     cfg = load_cfg()
@@ -128,11 +185,11 @@ def phase_pseudo(conditions: list[str]):
 
     print_merge_report(stats)
     print(f"\n  Time: {(time.time() - t0) / 60:.1f} min")
-    print("✓ Phase 3 complete.")
+    print("✓ Phase 5 complete.")
     return pseudo_dir
 
 
-# ── Phase 4: Student model ───────────────────────────────────────────────────
+# ── Phase 6: Student model ───────────────────────────────────────────────────
 
 def phase_student(conditions: list[str]):
     cfg = load_cfg()
@@ -179,10 +236,33 @@ def phase_student(conditions: list[str]):
     )
 
     best = ROOT / "runs" / "student" / "bina_v1" / "weights" / "best.pt"
-    print(f"\n✓ Phase 4 complete.")
+    print(f"\n✓ Phase 6 complete.")
     print(f"  Final model: {best}")
     print(f"  mAP50: {results.results_dict.get('metrics/mAP50(B)', 'N/A')}")
     return best
+
+
+# ── Phase 7: ONNX export + latency benchmark ─────────────────────────────────
+
+def phase_export(target: str, device: str, iters: int, warmup: int, imgsz: int):
+    print("\n" + "█"*60)
+    print("  PHASE 7 — ONNX EXPORT + LATENCY BENCHMARK (plan §4.4 / §5.3)")
+    print("█"*60)
+    print(f"  target={target}  device={device}  iters={iters}  warmup={warmup}")
+
+    if target in ("specialists", "all"):
+        print("\n  Exporting specialists...")
+        export_all_specialists(imgsz=imgsz)
+        print("\n  Benchmarking specialists...")
+        benchmark_specialists(device, iters, warmup, imgsz)
+
+    if target in ("student", "all"):
+        print("\n  Exporting student...")
+        export_student(imgsz=imgsz)
+        print("\n  Benchmarking student...")
+        benchmark_student(device, iters, warmup, imgsz)
+
+    print("\n✓ Phase 7 complete.")
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
@@ -193,7 +273,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--phase",
-        choices=["all", "normalize", "train", "pseudo", "student"],
+        choices=["all", "normalize", "hpo", "train", "validate",
+                 "pseudo", "student", "export"],
         default="all",
     )
     parser.add_argument(
@@ -213,9 +294,27 @@ if __name__ == "__main__":
         action="store_true",
         help="Resume interrupted specialist training",
     )
+    # HPO
+    parser.add_argument("--hpo-trials", type=int, default=20,
+                        help="Optuna trials per condition (--phase hpo)")
+    parser.add_argument("--hpo-epochs", type=int, default=8,
+                        help="epochs per HPO trial (plan §5.1: 5-10)")
+    parser.add_argument("--hpo-fraction", type=float, default=0.10,
+                        help="subset fraction for HPO (plan §5.1: 0.10)")
+    parser.add_argument("--hpo-seed", type=int, default=42)
+    parser.add_argument("--hpo-weight", default=None,
+                        help="override base weight for HPO (sweep architectures)")
+    # Export / benchmark
+    parser.add_argument("--target", choices=["specialists", "student", "all"],
+                        default="all", help="export/benchmark target")
+    parser.add_argument("--bench-device", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument("--bench-iters", type=int, default=500)
+    parser.add_argument("--bench-warmup", type=int, default=100)
+    parser.add_argument("--imgsz", type=int, default=640)
     args = parser.parse_args()
 
-    phases = (["normalize", "train", "pseudo", "student"]
+    # `all` runs the canonical training pipeline but skips HPO (exploratory).
+    phases = (["normalize", "train", "validate", "pseudo", "student", "export"]
               if args.phase == "all" else [args.phase])
 
     t_total = time.time()
@@ -223,12 +322,31 @@ if __name__ == "__main__":
     for phase in phases:
         if phase == "normalize":
             phase_normalize(args.conditions, args.domain_shift)
+        elif phase == "hpo":
+            phase_hpo(
+                args.conditions,
+                n_trials=args.hpo_trials,
+                epochs=args.hpo_epochs,
+                fraction=args.hpo_fraction,
+                seed=args.hpo_seed,
+                weight_override=args.hpo_weight,
+            )
         elif phase == "train":
             phase_train(args.conditions, args.resume)
+        elif phase == "validate":
+            phase_validate(args.conditions)
         elif phase == "pseudo":
             phase_pseudo(args.conditions)
         elif phase == "student":
             phase_student(args.conditions)
+        elif phase == "export":
+            phase_export(
+                args.target,
+                device=args.bench_device,
+                iters=args.bench_iters,
+                warmup=args.bench_warmup,
+                imgsz=args.imgsz,
+            )
 
     elapsed = (time.time() - t_total) / 3600
     print(f"\n{'='*60}")

@@ -16,6 +16,13 @@ PyYAML>=6.0
 tqdm>=4.66.0
 roboflow>=1.1.0         # for downloading Roboflow datasets
 
+# Hyperparameter optimization (Phase 2 — mini-runs, plan §5.1)
+optuna>=3.5.0
+
+# Edge-export benchmarking (Phase 7 — plan §4.4 / §5.3)
+onnx>=1.15.0
+onnxruntime>=1.16.0     # use onnxruntime-gpu for CUDA benchmarking
+
 # Optional: dataset download helpers
 kaggle>=1.6.0           # needs ~/.kaggle/kaggle.json
 requests>=2.31.0
