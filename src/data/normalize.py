@@ -10,7 +10,7 @@ Dataset → Condition Mapping:
   - plaque:        mendeley-dataset + CALCULUS_Dataset
   - discoloration: extensive (class 2)
   - ulcer:         extensive (class 1)
-  - recession:     gum_recession_dataset (class 0) + augmentation
+  - recession:     gum_recession_dataset (class 0) + Spot (class 5, polygons) + augmentation
 
 Usage:
   python src/data/normalize.py --condition caries
@@ -44,6 +44,8 @@ GINGIVITES_DATASET = BINA_DATASETS_DIR / "Gingivites_Dataset" / "Dataset"
 MENDELEY_DATASET = BINA_DATASETS_DIR / "mendeley-dataset-materials_Part_2" / "data"
 CALCULUS_DATASET = BINA_DATASETS_DIR / "CALCULUS_Dataset"
 GUM_RECESSION = BINA_DATASETS_DIR / "gum_recession_dataset"
+SPOT_DATASET = BINA_DATASETS_DIR / "Spot"
+BIG_GUM_DATASET = BINA_DATASETS_DIR / "big_gum_dataset"
 EXTENSIVE_DATASET = (
     BINA_DATASETS_DIR
     / "extensive_dataset"
@@ -120,6 +122,7 @@ def copy_yolo_with_remap(
     out_img_dir: Path,
     remap: dict[int, int],
     label_glob: str = "*.txt",
+    name_prefix: str = "",
 ) -> int:
     """
     Copy YOLO-format labels, remapping class IDs.
@@ -131,6 +134,8 @@ def copy_yolo_with_remap(
         out_img_dir: Output images directory
         remap: {source_class_id: target_class_id}
         label_glob: Glob pattern for label files
+        name_prefix: Prefix prepended to output filenames to avoid collisions
+            when merging multiple source datasets into one pool.
 
     Returns:
         Number of images copied
@@ -167,12 +172,13 @@ def copy_yolo_with_remap(
         for ext in [".jpg", ".jpeg", ".png", ".JPG", ".PNG", ".JPEG"]:
             img_src = src_img_dir / (img_stem + ext)
             if img_src.exists():
-                shutil.copy(img_src, out_img_dir / img_src.name)
+                out_name = f"{name_prefix}{img_src.name}"
+                shutil.copy(img_src, out_img_dir / out_name)
                 img_copied = True
                 break
 
         if img_copied:
-            (out_label_dir / lp.name).write_text("\n".join(lines_out))
+            (out_label_dir / f"{name_prefix}{lp.name}").write_text("\n".join(lines_out))
             copied += 1
 
     return copied
@@ -184,12 +190,16 @@ def copy_polygon_to_bbox(
     out_label_dir: Path,
     out_img_dir: Path,
     remap: dict[int, int],
+    name_prefix: str = "",
 ) -> int:
     """
     Convert YOLO polygon (segmentation) format to YOLO bbox, with class remapping.
 
     Polygon format: class_id x1 y1 x2 y2 x3 y3 ...
     Bbox format:    class_id cx cy w h
+
+    name_prefix is prepended to output filenames so multiple source datasets
+    can be merged into the same temp pool without collisions.
     """
     labels = list(src_label_dir.glob("*.txt"))
     copied = 0
@@ -228,12 +238,13 @@ def copy_polygon_to_bbox(
         for ext in [".jpg", ".jpeg", ".png", ".JPG", ".PNG", ".JPEG"]:
             img_src = src_img_dir / (img_stem + ext)
             if img_src.exists():
-                shutil.copy(img_src, out_img_dir / img_src.name)
+                out_name = f"{name_prefix}{img_src.name}"
+                shutil.copy(img_src, out_img_dir / out_name)
                 img_copied = True
                 break
 
         if img_copied:
-            (out_label_dir / lp.name).write_text("\n".join(lines_out))
+            (out_label_dir / f"{name_prefix}{lp.name}").write_text("\n".join(lines_out))
             copied += 1
 
     return copied
@@ -757,7 +768,9 @@ def normalize_recession(domain_shift: bool = False) -> None:  # noqa: ARG001
     """
     Normalize recession datasets:
     - gum_recession_dataset (class 0 → 0, ignore classes 1,2)
-    - Apply heavy augmentation (42 → ~300 images)
+    - Spot dataset (polygon, class 5 "Caries 5 class" → 0; other classes dropped)
+    - big_gum_dataset (bbox, class 1 "receding_gum" → 0; class 0 "diseased_gum" dropped)
+    - Apply heavy augmentation if train set is still small
     """
     condition = "recession"
     out = OUT_DIR / condition
@@ -771,7 +784,7 @@ def normalize_recession(domain_shift: bool = False) -> None:  # noqa: ARG001
 
     total = 0
 
-    # Source: gum_recession_dataset (class 0 = gum recession)
+    # Source 1: gum_recession_dataset (class 0 = gum recession)
     print("  Processing gum_recession_dataset...")
     if GUM_RECESSION.exists():
         src_img = GUM_RECESSION / "train" / "images"
@@ -780,6 +793,40 @@ def normalize_recession(domain_shift: bool = False) -> None:  # noqa: ARG001
             n = copy_yolo_with_remap(src_lbl, src_img, lbl_all, img_all, remap={0: 0})
             total += n
             print(f"    train: {n} images")
+
+    # Source 2: Spot dataset (polygon segmentation, class 5 = "Caries 5 class")
+    # Spot annotates recession as "Caries 5 class". We keep only class 5 lines
+    # (images with no class 5 are dropped automatically by copy_polygon_to_bbox
+    # when lines_out is empty) and remap to 0 to match the recession specialist.
+    print("  Processing Spot dataset (class 5 → recession)...")
+    if SPOT_DATASET.exists():
+        for split in ["train", "valid", "test"]:
+            src_img = SPOT_DATASET / split / "images"
+            src_lbl = SPOT_DATASET / split / "labels"
+            if src_img.exists():
+                n = copy_polygon_to_bbox(
+                    src_lbl, src_img, lbl_all, img_all,
+                    remap={5: 0}, name_prefix="spot_",
+                )
+                total += n
+                print(f"    {split}: {n} images with class 5")
+
+    # Source 3: big_gum_dataset (bbox, class 1 = "receding_gum")
+    # data.yaml: names: ['diseased_gum', 'receding_gum'] → only class 1 is recession.
+    # Class 0 (diseased_gum) is dropped per-line; images with no class 1 are
+    # skipped automatically when lines_out is empty.
+    print("  Processing big_gum_dataset (class 1 receding_gum → recession)...")
+    if BIG_GUM_DATASET.exists():
+        for split in ["train", "valid", "test"]:
+            src_img = BIG_GUM_DATASET / split / "images"
+            src_lbl = BIG_GUM_DATASET / split / "labels"
+            if src_img.exists():
+                n = copy_yolo_with_remap(
+                    src_lbl, src_img, lbl_all, img_all,
+                    remap={1: 0}, name_prefix="big_gum_",
+                )
+                total += n
+                print(f"    {split}: {n} images with receding_gum")
 
     # Create splits
     print("  Creating train/val/test splits...")

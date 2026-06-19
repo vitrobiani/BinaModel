@@ -95,7 +95,7 @@ Source datasets are stored in `BinaDatasets/` and normalized into `data/processe
 | **plaque** | mendeley-dataset + CALCULUS_Dataset | 4,091 | 819 | 547 | 5,457 |
 | **discoloration** | extensive (class 2) | 137 | 28 | 20 | 185 |
 | **ulcer** | extensive (class 1) | 196 | 40 | 27 | 263 |
-| **recession** | gum_recession_dataset (class 0) + augmentation | 177 | 5 | 5 | 187 |
+| **recession** | gum_recession_dataset (class 0) + Spot (class 5 polygons) + big_gum_dataset (class 1 receding_gum) | ~1,470 | ~294 | ~196 | ~1,961 |
 
 ### Source Dataset Locations
 
@@ -107,6 +107,8 @@ BinaDatasets/
 ├── mendeley-dataset-materials_Part_2/     # Custom 6-value format
 ├── CALCULUS_Dataset/             # YOLO format from Roboflow
 ├── gum_recession_dataset/        # YOLO format
+├── Spot/                         # YOLO polygon (9 classes; class 5 = recession source)
+├── big_gum_dataset/              # YOLO bbox (2 classes; class 1 receding_gum = recession source)
 └── extensive_dataset/            # Multi-class YOLO (0=caries, 1=ulcer, 2=discoloration, 3=gingivitis)
 ```
 
@@ -120,6 +122,8 @@ BinaDatasets/
 | mendeley-dataset | `flag cx cy w h tooth_id` | Keep flag=1, convert to YOLO |
 | CALCULUS_Dataset | YOLO bbox | Direct copy (class 0) |
 | gum_recession | YOLO bbox | Class 0 only + augmentation |
+| Spot | YOLO polygon | Polygon → bbox, keep only class 5 ("Caries 5 class") → 0, prefix `spot_` |
+| big_gum_dataset | YOLO bbox | Keep only class 1 (`receding_gum`) → 0, drop `diseased_gum`, prefix `big_gum_` |
 | extensive | YOLO bbox | Filter by class per condition |
 
 ---
@@ -409,11 +413,25 @@ The best plaque dataset uses disclosing gel (blue-stained teeth). `normalize.py`
 It's not perfect — consider fine-tuning the plaque specialist on even 50–100 natural-
 light images if you can get them from your intraoral camera.
 
-### Gum recession (weakest link)
-AlphaDent is the only public dataset with gum annotations from intraoral photos.
-If you can't access it, the gingivitis datasets contain MGI-4 labels that approximate
-recession. The pseudo-labeling from the other 5 models will generate additional
-recession annotations from unlabeled data — this helps significantly.
+### Gum recession (now broadly covered)
+Originally the weakest condition (~187 images from `gum_recession_dataset` alone),
+recession is now backed by three sources merged inside `normalize_recession`:
+
+- `gum_recession_dataset` — class 0, native bbox.
+- `Spot` — class 5 ("Caries 5 class"), YOLO polygon. Only lines tagged as class 5
+  are kept; all other Spot classes (Abrasion, other Caries levels, Crown, Filling)
+  are dropped per-line, and any image left with zero lines is skipped. Polygons
+  are reduced to enclosing bboxes by `polygon_to_bbox_yolo`.
+- `big_gum_dataset` — class 1 (`receding_gum`), YOLO bbox. Class 0 (`diseased_gum`)
+  is dropped; images without `receding_gum` are skipped.
+
+The Spot and big_gum imports get `spot_` / `big_gum_` filename prefixes when
+copied into the temp pool, so filename collisions across sources can't silently
+overwrite each other. Total recession pool is now ~1,961 images before re-split,
+so the `augment_small_dataset(target=300)` step in `normalize_recession` is now
+typically a no-op — bump the target up or remove the call once you've verified
+the real-data counts are sufficient. The pseudo-labeling pass from the other 5
+specialists still adds further annotations from unlabeled data.
 
 ---
 
@@ -428,6 +446,8 @@ bina-pipeline/
 │   ├── mendeley-dataset-materials_Part_2/
 │   ├── CALCULUS_Dataset/
 │   ├── gum_recession_dataset/
+│   ├── Spot/                  ← polygon; class 5 → recession
+│   ├── big_gum_dataset/       ← bbox; class 1 (receding_gum) → recession
 │   └── extensive_dataset/
 │
 ├── configs/
