@@ -1,0 +1,113 @@
+# ============================================================
+# Bina Pipeline — Master Configuration
+# ============================================================
+# Adjust paths and thresholds to your environment.
+# All relative paths are from the project root.
+
+project:
+  name: bina-pipeline
+  root: .                         # project root (set to absolute path in prod)
+  device: "0"                     # GPU index ("0"), or "cpu"
+
+# ── Directories ─────────────────────────────────────────────
+paths:
+  bina_datasets:     BinaDatasets      # source datasets (various formats)
+  data_raw:          data/raw          # downloaded / unzipped datasets live here
+  data_processed:    data/processed    # normalized per-condition YOLO datasets
+  data_unlabeled:    data/unlabeled    # images to pseudo-label (no annotations)
+  data_pseudo:       data/pseudo_labeled
+  models_dir:        runs/specialists  # where specialist checkpoints are saved
+  student_dir:       runs/student      # final fused model output
+  logs:              logs
+
+# ── Specialist models ────────────────────────────────────────
+# One entry per condition. Each points to its own dataset config.
+specialists:
+  caries:
+    config:      configs/models/caries.yaml
+    weight:      yolo11s.pt          # starting weights (downloaded automatically)
+    conf_thresh: 0.40                # min confidence to accept a pseudo-label
+    iou_thresh:  0.45                # NMS iou during specialist inference
+    class_id:    0                   # id in the UNIFIED class list below
+
+  gingivitis:
+    config:      configs/models/gingivitis.yaml
+    weight:      yolo11s.pt
+    conf_thresh: 0.45
+    iou_thresh:  0.45
+    class_id:    1
+
+  plaque:
+    config:      configs/models/plaque.yaml
+    weight:      yolo11s.pt
+    conf_thresh: 0.35                # looser — plaque boundaries are diffuse
+    iou_thresh:  0.50
+    class_id:    2
+
+  discoloration:
+    config:      configs/models/discoloration.yaml
+    weight:      yolo11s.pt
+    conf_thresh: 0.40
+    iou_thresh:  0.45
+    class_id:    3
+
+  ulcer:
+    config:      configs/models/ulcer.yaml
+    weight:      yolo11s.pt
+    conf_thresh: 0.50                # tighter — ulcers are small & precise
+    iou_thresh:  0.40
+    class_id:    4
+
+  recession:
+    config:      configs/models/recession.yaml
+    weight:      yolo11s.pt
+    conf_thresh: 0.38
+    iou_thresh:  0.45
+    class_id:    5
+
+# ── Unified class map (student model) ───────────────────────
+unified_classes:
+  - caries          # 0
+  - gingivitis       # 1
+  - plaque          # 2
+  - discoloration   # 3
+  - ulcer           # 4
+  - recession       # 5
+
+# ── Cross-model deduplication ────────────────────────────────
+# When two boxes from DIFFERENT models overlap above this IoU,
+# keep only the higher-confidence one.
+cross_model_iou_threshold: 0.60
+
+# ── Training (shared defaults, overridden per specialist) ────
+train:
+  epochs:       80
+  imgsz:        640
+  batch:        16                # RTX 4060 8GB can handle 16
+  optimizer:    AdamW
+  lr0:          0.001
+  lrf:          0.01
+  momentum:     0.937
+  weight_decay: 0.0005
+  warmup_epochs: 3
+  augment: true
+  # Dental-specific augmentation flags (passed via Ultralytics overrides)
+  hsv_h:   0.015   # hue shift — slight, keeps tissue color realistic
+  hsv_s:   0.4
+  hsv_v:   0.3
+  fliplr:  0.5
+  flipud:  0.0     # intraoral photos have fixed orientation
+  degrees: 5.0     # small rotation only
+  translate: 0.1
+  scale:   0.3
+  mosaic:  0.5     # mosaic augmentation probability
+  copy_paste: 0.0  # off — lesions shouldn't appear copy-pasted
+
+# ── Student model training ───────────────────────────────────
+student:
+  weight:        yolo11m.pt          # bigger backbone for the fused model
+  epochs:        120
+  imgsz:         640
+  batch:         12
+  pseudo_label_min_conf: 0.45        # second-pass filter on merged labels
+  real_data_weight: 2.0              # oversample real annotated data vs pseudo

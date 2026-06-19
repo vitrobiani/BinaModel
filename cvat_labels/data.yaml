@@ -1,7 +1,0 @@
-names:
-  0: Caries
-  1: Ulcer
-  2: Tooth Discoloration
-  3: Gingivitis
-path: .
-train: train.txt

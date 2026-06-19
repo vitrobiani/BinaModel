@@ -1,0 +1,26 @@
+# configs/models/gingivitis.yaml
+# ─────────────────────────────────────────────
+# Datasets:
+#   Primary : Data in Brief 2024 — 1,096 RGB intraoral images, MGI-annotated
+#             https://pmc.ncbi.nlm.nih.gov/articles/PMC11462013/
+#   Secondary: Scientific Reports 2021 — bounding-box annotations
+#             https://www.nature.com/articles/s41598-021-96091-3
+#
+# NOTE: The 2024 dataset has caption-style labels (per-tooth severity).
+# normalize.py converts these to bounding boxes around the gum regions.
+
+path:   ../../data/processed/gingivitis
+train:  images/train
+val:    images/val
+test:   images/test
+
+nc: 1
+names: ["gingivitis"]
+
+overrides:
+  epochs: 90
+  imgsz:  640
+  batch:  16
+  # Gum tissue is reddish — boost saturation sensitivity
+  hsv_s: 0.5
+  hsv_h: 0.02

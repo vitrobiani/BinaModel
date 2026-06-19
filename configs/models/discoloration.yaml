@@ -1,0 +1,30 @@
+# configs/models/discoloration.yaml
+# ─────────────────────────────────────────────
+# Datasets:
+#   Primary : Roboflow "Oral Dis" dataset — includes "Tooth Discoloration" class
+#             https://universe.roboflow.com/search?q=class:tooth+discoloration
+#   Secondary: Kaggle Dental Condition Dataset (Priyanshu9898)
+#             https://github.com/Priyanshu9898/Oral-Disease-Classification
+#
+# Roboflow download:
+#   from roboflow import Roboflow
+#   rf = Roboflow(api_key="YOUR_KEY")
+#   project = rf.workspace().project("oral-dis")
+#   dataset = project.version(2).download("yolov8")
+
+path:   ../../data/processed/discoloration
+train:  images/train
+val:    images/val
+test:   images/test
+
+nc: 1
+names: ["discoloration"]
+
+overrides:
+  epochs: 80
+  imgsz:  640
+  batch:  16
+  # Discoloration is color-defined — be conservative with HSV aug
+  hsv_s:  0.2
+  hsv_h:  0.01
+  hsv_v:  0.3

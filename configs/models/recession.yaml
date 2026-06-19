@@ -1,0 +1,33 @@
+# configs/models/recession.yaml
+# ─────────────────────────────────────────────
+# Datasets:
+#   Primary : AlphaDent (arxiv Jan 2025) — gum annotations from intraoral photos
+#             https://arxiv.org/abs/2507.22512
+#             (email authors or check supplementary for data release)
+#   Fallback : Extract recession annotations from gingivitis datasets where
+#              the annotators noted gum margin apical migration. Some MGI-4
+#              labels in the gingivitis dataset correspond to recession.
+#
+# ⚠️ This is the weakest dataset — expect lower mAP. The pseudo-labeling
+# from the other 5 models running on unlabeled images will help most here.
+
+path:   ../../data/processed/recession
+train:  images/train
+val:    images/val
+test:   images/test
+
+nc: 1
+names: ["recession"]
+
+overrides:
+  epochs:     100    # more epochs to squeeze out more from limited data
+  imgsz:      640
+  batch:      8      # smaller batch (less data)
+  lr0:        0.0005 # lower LR for small dataset
+  # More augmentation to compensate for dataset scarcity
+  flipud:     0.0
+  fliplr:     0.5
+  degrees:    10.0
+  translate:  0.15
+  scale:      0.35
+  mosaic:     0.8

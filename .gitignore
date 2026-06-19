@@ -1,0 +1,56 @@
+# ── Data ─────────────────────────────────────────────────────
+# Processed datasets + pseudo-labels (~19 GB), regenerable by normalize.py
+/data/
+# Raw source datasets (see configs/models/*.yaml for sources)
+/BinaDatasets/
+
+# ── Model weights & training outputs ─────────────────────────
+# Training/inference outputs (~4 GB)
+/runs/
+# PyTorch checkpoints — yolo*.pt are auto-downloaded by ultralytics
+*.pt
+*.pth
+*.onnx
+*.weights
+*.engine
+
+# ── Generated inference artifacts ────────────────────────────
+result.jpg
+result_*.jpg
+analyzed/
+results/
+logs/
+*.log
+
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.Python
+
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+
+# ── Jupyter ──────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── IDE / editor ─────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS ───────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Claude Code (user-specific only) ─────────────────────────
+.claude/settings.local.json

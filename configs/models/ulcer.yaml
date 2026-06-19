@@ -1,0 +1,25 @@
+# configs/models/ulcer.yaml
+# ─────────────────────────────────────────────
+# Datasets:
+#   Primary : Roboflow "Oral Dis" — "Mouth Ulcer" class
+#             https://universe.roboflow.com/search?q=class:mouth+ulcer
+#   Secondary: Kaggle oral_ulcer dataset
+#             https://www.kaggle.com/datasets/bavithravairam/oral-ulcer
+#   Tertiary : Roboflow teeth-disease — "ulcer" class
+#             https://universe.roboflow.com/oral-disease-detection/teeth-disease-m1uob
+
+path:   ../../data/processed/ulcer
+train:  images/train
+val:    images/val
+test:   images/test
+
+nc: 1
+names: ["ulcer"]
+
+overrides:
+  epochs:  90
+  imgsz:   640
+  batch:   16
+  # Ulcers are small — use higher resolution crops in augmentation
+  scale:   0.2    # less scale jitter (don't shrink small lesions)
+  mosaic:  0.3    # less mosaic (small objects get lost)

@@ -1,0 +1,30 @@
+# configs/models/caries.yaml
+# ─────────────────────────────────────────────
+# Datasets:
+#   Primary : Scientific Data (Nature) 2025  — 6,313 RGB intraoral images
+#             https://www.nature.com/articles/s41597-025-05647-9
+#   Secondary: Dentalai (Dataset Ninja) — 2,495 images, pixel-level
+#             https://datasetninja.com/dentalai
+#
+# After downloading, put both under data/raw/caries/ and run
+#   python src/data/normalize.py --condition caries
+# to merge & convert to YOLO det format.
+
+path:   ../../data/processed/caries
+train:  images/train
+val:    images/val
+test:   images/test
+
+nc: 1
+names: ["caries"]
+
+# Training overrides (merged with pipeline.yaml defaults)
+overrides:
+  epochs:      100
+  imgsz:       640
+  batch:       16
+  conf:        0.25       # lower detection threshold during training eval
+  # Caries-specific: slightly more aggressive color jitter because
+  # early caries is subtle and lighting varies a lot across datasets
+  hsv_s: 0.5
+  hsv_v: 0.4
