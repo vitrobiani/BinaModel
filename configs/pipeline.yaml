@@ -98,11 +98,12 @@ kpi_gate:
 specialist_archs:
   # Phase 1A — Ultralytics-API compatible
   - yolo26s            # baseline, direct YOLO11s migration
-  - yolo26x            # heavy YOLO sanity-check on capacity ceiling
-  - rtdetr-l           # transformer real-time detector
   # Phase 1B — torchvision + HuggingFace adapters
   - frcnn-r50          # Faster R-CNN ResNet-50-FPN (plan §2.1 reference)
   - detr-r50           # DETR-R50 transformer (auto-skipped on small data)
+  # yolo26x removed: OOMs on 4070 12GB even at small batch once VRAM fragments.
+  # rtdetr-l removed: Ultralytics RTDETR class forces imgsz=1280 internally,
+  # needs ~21GB VRAM, iter times 10-80s. ~6 days/sweep — not viable on 4070.
 
 # ── HPO (plan §5.1) — Optuna mini-run defaults ───────────────
 # These are search-space bounds and budget hints; the runner overrides via CLI.
@@ -114,7 +115,7 @@ hpo:
   search_space:
     lr0:          [1.0e-5, 1.0e-1]      # log-uniform
     weight_decay: [1.0e-5, 1.0e-3]      # log-uniform
-    batch:        [16, 32, 64]          # categorical
+    batch:        [4, 8, 16]            # capped: yolo26x at imgsz=640 OOMs >16 on 4070 12GB
 
 # ── Edge-export hardware gate (plan §4.4 / §5.3 milestone 3) ──
 edge_gate:
@@ -125,7 +126,8 @@ edge_gate:
 train:
   epochs:       80
   imgsz:        640
-  batch:        16                # RTX 4060 8GB can handle 16
+  batch:        16                # RTX 4070 12GB ceiling for yolo26s @ 640
+  workers:      2                 # Windows pagefile-safe (8 default → WinError 1455)
   optimizer:    AdamW
   lr0:          0.001
   lrf:          0.01
@@ -147,9 +149,13 @@ train:
 
 # ── Student model training ───────────────────────────────────
 student:
-  weight:        yolo26m.pt          # bigger backbone for the fused model
+  # yolo26s chosen for edge fit: 9.5M params / 22 GFLOPs / ~20MB ONNX.
+  # yolo26m exceeded both edge gates (weights 78MB > 30MB, latency 112ms > 100ms).
+  # Trade-off: ~5-10% mAP dip vs yolo26m, but per-class gates should still hold
+  # for plaque/caries/gingivitis/recession. ulcer borderline either way.
+  weight:        yolo26s.pt
   epochs:        120
   imgsz:         640
-  batch:         12
+  batch:         16                  # yolo26s fits batch=16 on 4070 12GB
   pseudo_label_min_conf: 0.45        # second-pass filter on merged labels
   real_data_weight: 2.0              # oversample real annotated data vs pseudo

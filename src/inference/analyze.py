@@ -34,7 +34,7 @@ import yaml
 from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
 PIPELINE_CFG = ROOT / "configs" / "pipeline.yaml"
 CONDITIONS = ["caries", "gingivitis", "plaque", "discoloration", "ulcer", "recession"]
@@ -52,7 +52,7 @@ COLORS = {
 
 def load_config() -> dict:
     """Load pipeline configuration."""
-    with open(PIPELINE_CFG) as f:
+    with open(PIPELINE_CFG, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 

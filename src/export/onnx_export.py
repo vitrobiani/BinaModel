@@ -20,19 +20,25 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
 CONDITIONS = ["caries", "gingivitis", "plaque", "discoloration", "ulcer", "recession"]
 
 
 def export_ckpt(ckpt: Path, *, imgsz: int = 640, opset: int = 12,
-                dynamic: bool = False, simplify: bool = True) -> Path:
-    """Export a single .pt checkpoint to ONNX. Returns the .onnx path."""
+                dynamic: bool = False, simplify: bool = True,
+                half: bool = False) -> Path:
+    """Export a single .pt checkpoint to ONNX. Returns the .onnx path.
+
+    `half=True` exports weights as FP16, halving file size with virtually
+    no accuracy loss for detection. Required to fit the student under the
+    30MB edge gate. FP16 is supported natively on Jetson and modern Pi 5.
+    """
     from ultralytics import YOLO  # imported lazily so --help works without torch
 
     if not ckpt.exists():
         raise FileNotFoundError(ckpt)
-    print(f"  exporting {ckpt}")
+    print(f"  exporting {ckpt}  (half={half})")
     model = YOLO(str(ckpt))
     onnx_path = model.export(
         format="onnx",
@@ -40,6 +46,7 @@ def export_ckpt(ckpt: Path, *, imgsz: int = 640, opset: int = 12,
         opset=opset,
         dynamic=dynamic,
         simplify=simplify,
+        half=half,
     )
     onnx_path = Path(onnx_path)
     size_mb = onnx_path.stat().st_size / (1024 * 1024)
@@ -59,12 +66,15 @@ def export_all_specialists(imgsz: int = 640) -> list[Path]:
     return results
 
 
-def export_student(imgsz: int = 640) -> Path | None:
+def export_student(imgsz: int = 640, half: bool = True) -> Path | None:
+    """Student defaults to FP16 to fit the 30MB edge gate. Specialists stay
+    FP32 because they're internal-only (only run during pseudo-labeling on
+    the training machine, never deployed)."""
     ckpt = ROOT / "runs" / "student" / "bina_v1" / "weights" / "best.pt"
     if not ckpt.exists():
         print(f"  no student checkpoint at {ckpt}")
         return None
-    return export_ckpt(ckpt, imgsz=imgsz)
+    return export_ckpt(ckpt, imgsz=imgsz, half=half)
 
 
 if __name__ == "__main__":

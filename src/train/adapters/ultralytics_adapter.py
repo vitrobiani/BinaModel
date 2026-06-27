@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 _TRAIN_KEYS = (
     "epochs", "imgsz", "batch", "optimizer", "lr0", "lrf", "momentum",
-    "weight_decay", "warmup_epochs",
+    "weight_decay", "warmup_epochs", "workers",
     "hsv_h", "hsv_s", "hsv_v", "fliplr", "flipud", "degrees",
     "translate", "scale", "mosaic", "copy_paste",
 )
@@ -91,32 +91,45 @@ class UltralyticsAdapter(SpecialistAdapter):
         device: str = "0",
     ) -> list[Prediction]:
         from ultralytics import YOLO  # lazy
+        import gc
 
         model = YOLO(str(ckpt))
-        results = model.predict(
-            source=[str(p) for p in img_paths],
-            conf=conf_min,
-            iou=0.50,
-            imgsz=imgsz,
-            device=device,
-            batch=batch,
-            verbose=False,
-            stream=False,
-        )
+
+        # Ultralytics' model.predict ignores the `batch` arg when `source` is a
+        # Python list of paths — it tries to stack ALL images into a single
+        # forward pass, OOMing on anything past ~50 imgs at 640px. So we chunk
+        # the source list ourselves and call predict per chunk. stream=True
+        # additionally frees Results between iters within each chunk.
         out: list[Prediction] = []
-        for res in results:
-            if res.boxes is None or len(res.boxes) == 0:
-                out.append(Prediction(
-                    boxes_xyxyn=np.zeros((0, 4), dtype=np.float32),
-                    scores=np.zeros((0,), dtype=np.float32),
-                    labels=np.zeros((0,), dtype=np.int64),
-                ))
-                continue
-            # Ultralytics offers xyxyn (normalized xyxy).
-            xyxyn = res.boxes.xyxyn.cpu().numpy().astype(np.float32)
-            conf = res.boxes.conf.cpu().numpy().astype(np.float32)
-            cls = res.boxes.cls.cpu().numpy().astype(np.int64)
-            out.append(Prediction(boxes_xyxyn=xyxyn, scores=conf, labels=cls))
+        chunk_size = max(batch, 16)
+        for i in range(0, len(img_paths), chunk_size):
+            chunk = [str(p) for p in img_paths[i:i + chunk_size]]
+            results = model.predict(
+                source=chunk,
+                conf=conf_min,
+                iou=0.50,
+                imgsz=imgsz,
+                device=device,
+                batch=batch,
+                verbose=False,
+                stream=True,
+            )
+            for res in results:
+                if res.boxes is None or len(res.boxes) == 0:
+                    out.append(Prediction(
+                        boxes_xyxyn=np.zeros((0, 4), dtype=np.float32),
+                        scores=np.zeros((0,), dtype=np.float32),
+                        labels=np.zeros((0,), dtype=np.int64),
+                    ))
+                    continue
+                # Ultralytics offers xyxyn (normalized xyxy).
+                xyxyn = res.boxes.xyxyn.cpu().numpy().astype(np.float32)
+                conf = res.boxes.conf.cpu().numpy().astype(np.float32)
+                cls = res.boxes.cls.cpu().numpy().astype(np.int64)
+                out.append(Prediction(boxes_xyxyn=xyxyn, scores=conf, labels=cls))
+            # Drop the chunk's predictor state before the next chunk allocates.
+            del results
+            gc.collect()
         return out
 
     # ── mAP@0.5 ──────────────────────────────────────────────────────────────

@@ -244,7 +244,7 @@ class FasterRCNNAdapter(SpecialistAdapter):
         img_paths: list[Path],
         *,
         conf_min: float = 0.001,
-        imgsz: int = 640,    # unused — FRCNN handles native resolution
+        imgsz: int = 640,
         batch: int = 4,
         device: str = "0",
     ) -> list[Prediction]:
@@ -268,10 +268,24 @@ class FasterRCNNAdapter(SpecialistAdapter):
                     continue
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 h, w = rgb.shape[:2]
+                # Resize so the longer side == imgsz. Without this, 1080p+
+                # unlabeled photos take 2-5s/img on FRCNN-R50 (15-30 min per
+                # specialist on a 1500-img pool). Aspect ratio preserved.
+                # We then normalize boxes by the SEEN dims (the resized
+                # dims), so the downstream [0,1] xyxyn is correct regardless
+                # of original resolution.
+                scale = imgsz / max(h, w)
+                if scale < 1.0:
+                    new_w, new_h = int(round(w * scale)), int(round(h * scale))
+                    rgb = cv2.resize(rgb, (new_w, new_h),
+                                     interpolation=cv2.INTER_AREA)
+                    seen_h, seen_w = new_h, new_w
+                else:
+                    seen_h, seen_w = h, w
                 imgs.append(
                     torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
                 )
-                sizes.append((h, w))
+                sizes.append((seen_h, seen_w))
             imgs = [im.to(dev) for im in imgs]
             outs = model(imgs)
             for out, (h, w) in zip(outs, sizes):

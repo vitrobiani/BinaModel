@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
 from train.train_specialist import specialist_run_dir  # noqa: E402
 
@@ -50,7 +50,7 @@ def _load_results() -> list[dict]:
         raise FileNotFoundError(
             f"No sweep results at {SWEEP_RESULTS}. Run src/train/sweep.py first."
         )
-    data = json.loads(SWEEP_RESULTS.read_text())
+    data = json.loads(SWEEP_RESULTS.read_text(encoding="utf-8"))
     return data.get("results", [])
 
 

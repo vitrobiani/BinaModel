@@ -22,7 +22,10 @@ optuna>=3.5.0
 # Phase 1B — non-Ultralytics specialist adapters
 # torchvision already pinned above; covers Faster R-CNN ResNet-50-FPN.
 transformers>=4.40.0    # HuggingFace DETR-R50 ("facebook/detr-resnet-50")
-torchmetrics>=1.3.0     # mAP@0.5 evaluation for FRCNN + DETR
+torchmetrics>=1.4.0     # mAP@0.5 eval for FRCNN+DETR; >=1.4 detects faster-coco-eval
+faster-coco-eval>=1.6   # COCO eval backend torchmetrics MAP needs (better-maintained
+                        # than pycocotools on Windows/Py3.13 — no C-build required)
+pycocotools>=2.0.7      # fallback COCO backend that older torchmetrics also detect
 timm>=0.9.0             # used by HF DETR backbone helpers
 Pillow>=10.0.0          # already above; required by DetrImageProcessor
 

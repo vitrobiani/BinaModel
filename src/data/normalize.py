@@ -519,7 +519,7 @@ def write_dataset_yaml(out_dir: Path, condition: str) -> None:
     }
 
     yaml_path = out_dir / "dataset.yaml"
-    with open(yaml_path, "w") as f:
+    with open(yaml_path, "w", encoding="utf-8") as f:
         yaml.dump(yaml_content, f, default_flow_style=False)
 
 

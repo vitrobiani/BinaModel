@@ -26,7 +26,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
 PIPELINE_CFG = ROOT / "configs" / "pipeline.yaml"
 CONDITIONS = ["caries", "gingivitis", "plaque", "discoloration", "ulcer", "recession"]
@@ -36,7 +36,7 @@ HPO_OVERRIDABLE = ("lr0", "weight_decay", "batch")
 
 
 def load_pipeline_cfg():
-    with open(PIPELINE_CFG) as f:
+    with open(PIPELINE_CFG, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -81,7 +81,7 @@ def _maybe_apply_hpo_overrides(
     if not hpo_path.exists():
         return train_args
     try:
-        hpo = json.loads(hpo_path.read_text())
+        hpo = json.loads(hpo_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return train_args
     best = hpo.get("best")
@@ -135,7 +135,7 @@ def train_specialist(
     defaults = cfg["train"]
 
     model_cfg_path = ROOT / spec["config"]
-    with open(model_cfg_path) as f:
+    with open(model_cfg_path, encoding="utf-8") as f:
         model_cfg = yaml.safe_load(f)
 
     # Merge: pipeline defaults → model-level overrides → HPO best → CLI overrides
@@ -190,7 +190,7 @@ def _write_dataset_yaml(condition: str, model_cfg: dict):
         "nc":    model_cfg.get("nc", 1),
         "names": model_cfg.get("names", [condition]),
     }
-    with open(out_dir / "dataset.yaml", "w") as f:
+    with open(out_dir / "dataset.yaml", "w", encoding="utf-8") as f:
         yaml.dump(yaml_content, f, default_flow_style=False)
 
 

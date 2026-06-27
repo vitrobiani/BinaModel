@@ -52,9 +52,10 @@ from train.promote import promote
 from inference.ensemble import load_specialists, run_ensemble
 from inference.merge import (
     merge_detections,
-    write_student_dataset_yaml,
+    write_student_dataset_yaml,   # legacy — kept for backwards compat
     print_merge_report,
 )
+from student.prepare_dataset import prepare_student_dataset
 from validation.threshold_finder import find_specialist_threshold, _summarize as _th_summary
 from validation.kpi_gate import evaluate_specialist, write_manifest as write_kpi_manifest, _summarize as _kpi_summary
 from export.onnx_export import export_all_specialists, export_student
@@ -65,7 +66,7 @@ CONDITIONS = ["caries", "gingivitis", "plaque", "discoloration", "ulcer", "reces
 
 
 def load_cfg() -> dict:
-    with open(PIPELINE_CFG) as f:
+    with open(PIPELINE_CFG, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -85,7 +86,8 @@ def phase_normalize(conditions: list[str], domain_shift: bool):
 
 def phase_sweep(archs: list[str], conditions: list[str], *,
                 skip_hpo: bool, hpo_trials: int, hpo_epochs: int,
-                hpo_fraction: float, hpo_seed: int, resume: bool):
+                hpo_fraction: float, hpo_seed: int, resume: bool,
+                train_overrides: dict | None = None):
     print("\n" + "█" * 60)
     print("  PHASE 1B — MULTI-ARCH SPECIALIST SWEEP")
     print("█" * 60)
@@ -97,6 +99,7 @@ def phase_sweep(archs: list[str], conditions: list[str], *,
         hpo_fraction=hpo_fraction,
         hpo_seed=hpo_seed,
         resume=resume,
+        train_overrides=train_overrides,
     )
     print(_sweep_summary(out["results"]))
     return out
@@ -229,24 +232,38 @@ def phase_pseudo(conditions: list[str]):
 
 # ── Phase 6: Student model ───────────────────────────────────────────────────
 
+def phase_student_prepare():
+    """Phase 3a — assemble the unified multi-class student dataset.
+
+    Materializes data/student/ by copying real data with single-class→unified
+    class-id remapping AND appending the (filtered) pseudo-labels. Separated
+    from training so you can re-prep without retraining (e.g. after refiltering
+    pseudo-labels)."""
+    print("\n" + "█" * 60)
+    print("  PHASE 3a — STUDENT DATASET PREPARATION")
+    print("█" * 60)
+    dataset_yaml = prepare_student_dataset()
+    print(f"\n✓ Phase 3a complete.  Dataset YAML: {dataset_yaml}")
+    return dataset_yaml
+
+
 def phase_student(conditions: list[str]):
+    """Phase 3b — train the multi-class student on the unified dataset.
+
+    Reads data/student/dataset.yaml (produced by phase_student_prepare). Falls
+    back to running prepare if the unified dataset doesn't exist yet so the
+    user can run --phase student in one shot."""
     cfg = load_cfg()
     s_cfg = cfg["student"]
-    pseudo_dir = ROOT / cfg["paths"]["data_pseudo"]
 
-    # Build list of real data dirs (all conditions' processed dirs)
-    real_dirs = [ROOT / cfg["paths"]["data_processed"] / c for c in conditions]
+    print("\n" + "█" * 60)
+    print("  PHASE 3b — STUDENT MODEL TRAINING")
+    print("█" * 60)
 
-    print("\n" + "█"*60)
-    print("  PHASE 4 — STUDENT MODEL TRAINING")
-    print("█"*60)
-
-    if not pseudo_dir.exists():
-        print("  ⚠  No pseudo-labeled data found. Running on real data only.")
-        print("     Run --phase pseudo first to generate pseudo labels.")
-
-    # Write combined dataset YAML
-    dataset_yaml = write_student_dataset_yaml(pseudo_dir, real_dirs)
+    dataset_yaml = ROOT / "data" / "student" / "dataset.yaml"
+    if not dataset_yaml.exists():
+        print("  No data/student/dataset.yaml — running prep first.")
+        dataset_yaml = phase_student_prepare()
 
     print(f"\n  Base weights:   {s_cfg['weight']}")
     print(f"  Epochs:         {s_cfg['epochs']}")
@@ -312,7 +329,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--phase",
         choices=["all", "normalize", "hpo", "sweep", "promote", "train",
-                 "validate", "pseudo", "student", "export"],
+                 "validate", "pseudo", "student-prepare", "student", "export"],
         default="all",
     )
     parser.add_argument(
@@ -350,6 +367,11 @@ if __name__ == "__main__":
     parser.add_argument("--force-best", action="store_true",
                         help="promote highest-mAP even if no candidate "
                              "passes the KPI gate (smoke-test only)")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="override train.epochs in pipeline.yaml "
+                             "(useful for smoke tests; e.g. --epochs 3)")
+    parser.add_argument("--batch", type=int, default=None,
+                        help="override train.batch in pipeline.yaml")
     # Export / benchmark
     parser.add_argument("--target", choices=["specialists", "student", "all"],
                         default="all", help="export/benchmark target")
@@ -378,6 +400,11 @@ if __name__ == "__main__":
                 weight_override=args.hpo_weight,
             )
         elif phase == "sweep":
+            train_overrides: dict = {}
+            if args.epochs is not None:
+                train_overrides["epochs"] = args.epochs
+            if args.batch is not None:
+                train_overrides["batch"] = args.batch
             phase_sweep(
                 args.archs, args.conditions,
                 skip_hpo=args.skip_hpo,
@@ -386,6 +413,7 @@ if __name__ == "__main__":
                 hpo_fraction=args.hpo_fraction,
                 hpo_seed=args.hpo_seed,
                 resume=args.resume,
+                train_overrides=train_overrides or None,
             )
         elif phase == "promote":
             phase_promote(args.conditions, force_best=args.force_best)
@@ -395,6 +423,8 @@ if __name__ == "__main__":
             phase_validate(args.conditions)
         elif phase == "pseudo":
             phase_pseudo(args.conditions)
+        elif phase == "student-prepare":
+            phase_student_prepare()
         elif phase == "student":
             phase_student(args.conditions)
         elif phase == "export":

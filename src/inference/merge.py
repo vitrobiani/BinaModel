@@ -230,7 +230,7 @@ def write_student_dataset_yaml(pseudo_dir: Path, real_dirs: list[Path]):
                   "discoloration", "ulcer", "recession"],
     }
 
-    with open(cfg_path, "w") as f:
+    with open(cfg_path, "w", encoding="utf-8") as f:
         yaml.dump(content, f, default_flow_style=False)
 
     print(f"✓ Student dataset YAML written to {cfg_path}")

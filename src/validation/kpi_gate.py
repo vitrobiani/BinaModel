@@ -32,11 +32,12 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
 from train.train_specialist import specialist_run_dir, slug_from_weight  # noqa: E402
 from train.adapters import get_adapter  # noqa: E402
 from validation.threshold_finder import (  # noqa: E402
+    _detect_promoted_arch,
     collect_predictions,
     find_threshold,
 )
@@ -56,7 +57,7 @@ def evaluate_specialist(condition: str, *, arch: str | None = None) -> dict:
     arch=None evaluates the canonical specialist; arch="yolo26s" / ...
     evaluates the corresponding sweep candidate.
     """
-    cfg = yaml.safe_load(PIPELINE_CFG.read_text())
+    cfg = yaml.safe_load(PIPELINE_CFG.read_text(encoding="utf-8"))
     run_dir = specialist_run_dir(condition, arch)
     ckpt = run_dir / "weights" / "best.pt"
     if not ckpt.exists():
@@ -68,18 +69,17 @@ def evaluate_specialist(condition: str, *, arch: str | None = None) -> dict:
             f"No threshold.json at {threshold_path}. "
             "Run threshold_finder first."
         )
-    th = json.loads(threshold_path.read_text())
-    if not th.get("passed"):
-        return {
-            "condition": condition,
-            "passed": False,
-            "reason": "val-calibrated threshold did not pass",
-            "threshold_report": th,
-        }
-    calibrated_conf = float(th["threshold"])
+    th = json.loads(threshold_path.read_text(encoding="utf-8"))
+    threshold_passed = bool(th.get("passed"))
+    # threshold_finder always returns a usable "threshold" — either the strict
+    # P>=0.95/R>=0.60 cutoff (mode=strict), the max-precision-subject-to-R
+    # cutoff (mode=recall_anchored), or the F1-optimal cutoff (mode=f1_optimal).
+    # The "passed" flag tells us if the strict gate was met for gate-pass logic;
+    # the threshold itself is always operationally usable for pseudo-labeling.
+    calibrated_conf = float(th.get("threshold", 1.0))
 
     data_yaml_path = ROOT / "data" / "processed" / condition / "dataset.yaml"
-    data_yaml = yaml.safe_load(data_yaml_path.read_text())
+    data_yaml = yaml.safe_load(data_yaml_path.read_text(encoding="utf-8"))
     base = Path(data_yaml["path"])
     test_img_rel = data_yaml.get("test", "images/test")
     test_img = base / test_img_rel
@@ -93,7 +93,9 @@ def evaluate_specialist(condition: str, *, arch: str | None = None) -> dict:
             "threshold_report": th,
         }
 
-    effective_arch = arch or slug_from_weight(
+    # Match threshold_finder's arch detection: kpi_gate.json → promotions.json
+    # → pipeline.yaml. Without this, frcnn-r50/detr-r50 promotions crash here.
+    effective_arch = arch or _detect_promoted_arch(condition) or slug_from_weight(
         cfg["specialists"][condition]["weight"]
     )
     adapter = get_adapter(effective_arch)
@@ -125,12 +127,17 @@ def evaluate_specialist(condition: str, *, arch: str | None = None) -> dict:
     map_ok = map50 >= TARGET_MAP50
     prec_ok = test_precision >= TARGET_PRECISION
     rec_ok = test_recall >= MIN_RECALL
-    passed = map_ok and prec_ok and rec_ok
+    # A specialist only graduates if the val threshold cleared P>=0.95 AND
+    # all test-side gates clear. Reporting the metrics regardless makes
+    # smoke-test diagnostics readable.
+    passed = threshold_passed and map_ok and prec_ok and rec_ok
 
     result = {
         "condition": condition,
+        "arch": effective_arch,   # always record — ensemble.py depends on it
         "passed": passed,
         "calibrated_conf": calibrated_conf,
+        "threshold_passed": threshold_passed,
         "metrics": {
             "mAP50": map50,
             "test_precision": test_precision,
@@ -140,14 +147,13 @@ def evaluate_specialist(condition: str, *, arch: str | None = None) -> dict:
             "test_gt": int(total_gt),
         },
         "gates": {
+            "val_threshold_passed": threshold_passed,
             "mAP50_>=0.85": map_ok,
             "precision_>=0.95": prec_ok,
             "recall_>=0.60": rec_ok,
         },
         "threshold_report": th,
     }
-    if arch:
-        result["arch"] = arch
     return result
 
 

@@ -30,7 +30,7 @@ import numpy as np
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
 from train.train_specialist import specialist_run_dir, slug_from_weight  # noqa: E402
 from train.adapters import get_adapter  # noqa: E402
@@ -101,36 +101,66 @@ def collect_predictions(
     imgsz: int = 640,
     device: str = "0",
     batch: int = 16,
+    chunk_size: int = 64,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """
     Run inference at a very low conf via the per-arch adapter, then greedily
     IoU-match each prediction against ground-truth (highest-conf first,
     IoU>=IOU_MATCH). Family-agnostic — works for YOLO, RT-DETR, FRCNN, DETR.
 
+    `chunk_size` bounds peak RAM by passing only N images at a time to
+    adapter.predict_batch — Ultralytics' Results objects hold large tensor
+    state, and accumulating 244+ of them at conf_min=0.001 (max_det=300/img)
+    has produced MemoryError on plaque-sized val sets.
+
     Returns:
       pred_conf: (K,) confidence per prediction (across the whole val set)
       pred_tp:   (K,) 1 if matched a GT (TP), else 0 (FP)
       total_gt:  total GT box count
     """
+    import gc
+
     adapter = get_adapter(arch)
     img_paths = sorted([f for f in img_dir.iterdir()
                         if f.suffix.lower() in {".jpg", ".jpeg", ".png"}])
-
-    predictions = adapter.predict_batch(
-        ckpt, img_paths,
-        conf_min=conf_min,
-        imgsz=imgsz,
-        batch=batch,
-        device=device,
-    )
 
     confidences: list[float] = []
     tps: list[int] = []
     total_gt = 0
 
+    for chunk_start in range(0, len(img_paths), chunk_size):
+        chunk = img_paths[chunk_start:chunk_start + chunk_size]
+        predictions = adapter.predict_batch(
+            ckpt, chunk,
+            conf_min=conf_min,
+            imgsz=imgsz,
+            batch=batch,
+            device=device,
+        )
+        total_gt += _accumulate_chunk(
+            chunk, predictions, lbl_dir,
+            confidences, tps,
+        )
+        # Drop the chunk's Results so the next chunk starts from clean RAM.
+        del predictions
+        gc.collect()
+
+    return np.asarray(confidences), np.asarray(tps, dtype=np.int64), total_gt
+
+
+def _accumulate_chunk(
+    img_paths: list[Path],
+    predictions: list,
+    lbl_dir: Path,
+    confidences: list[float],
+    tps: list[int],
+) -> int:
+    """Per-image greedy IoU match → append to confidences/tps lists in place.
+    Returns the number of GT boxes seen in this chunk."""
+    chunk_gt = 0
     for img_path, pred in zip(img_paths, predictions):
         gt = _load_yolo_labels(lbl_dir / f"{img_path.stem}.txt")
-        total_gt += len(gt)
+        chunk_gt += len(gt)
         gt_xyxy = _cxcywh_to_xyxy(gt)
 
         if len(pred.boxes_xyxyn) == 0:
@@ -163,7 +193,7 @@ def collect_predictions(
                 tps.append(0)
             confidences.append(float(pred_conf[i]))
 
-    return np.asarray(confidences), np.asarray(tps, dtype=np.int64), total_gt
+    return chunk_gt
 
 
 # ── Threshold selection ──────────────────────────────────────────────────────
@@ -184,11 +214,23 @@ def find_threshold(
     if total_gt == 0:
         return {
             "passed": False,
+            "mode": "no_gt",
             "reason": "no ground-truth boxes in val set",
             "threshold": 1.0,
             "precision": 0.0,
             "recall": 0.0,
             "n_predictions": int(len(pred_conf)),
+        }
+    if len(pred_conf) == 0:
+        return {
+            "passed": False,
+            "mode": "no_predictions",
+            "reason": "model produced zero predictions even at conf_min=0.001",
+            "threshold": 1.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "total_gt": int(total_gt),
+            "n_predictions": 0,
         }
 
     order = np.argsort(-pred_conf)
@@ -200,38 +242,67 @@ def find_threshold(
     precision = cum_tp / np.maximum(cum_tp + cum_fp, 1)
     recall = cum_tp / total_gt
 
-    # The smallest threshold satisfying both constraints corresponds to the
-    # highest index `i` where precision[i] >= target AND recall[i] >= min.
-    best = None
-    for i in range(len(confs)):
-        if precision[i] >= target_precision and recall[i] >= min_recall:
-            best = {
-                "threshold": float(confs[i]),
-                "precision": float(precision[i]),
-                "recall": float(recall[i]),
-                "tp": int(cum_tp[i]),
-                "fp": int(cum_fp[i]),
-            }
-
-    if best is None:
-        max_p = float(precision.max()) if len(precision) else 0.0
-        idx = int(np.argmax(precision)) if len(precision) else 0
+    # Tier 1 — strict gate: smallest threshold (highest index i, since confs
+    # are sorted DESC) where precision[i] >= target AND recall[i] >= min.
+    strict_mask = (precision >= target_precision) & (recall >= min_recall)
+    if strict_mask.any():
+        i = int(np.where(strict_mask)[0][-1])
         return {
-            "passed": False,
-            "reason": (f"no threshold meets precision>={target_precision} "
-                       f"and recall>={min_recall}"),
-            "best_precision_seen": max_p,
-            "recall_at_best_precision": float(recall[idx]) if len(recall) else 0.0,
-            "threshold_at_best_precision": (
-                float(confs[idx]) if len(confs) else 1.0),
+            "passed": True,
+            "mode": "strict",
+            "threshold": float(confs[i]),
+            "precision": float(precision[i]),
+            "recall": float(recall[i]),
+            "tp": int(cum_tp[i]),
+            "fp": int(cum_fp[i]),
             "total_gt": int(total_gt),
             "n_predictions": int(len(pred_conf)),
         }
 
-    best["passed"] = True
-    best["total_gt"] = int(total_gt)
-    best["n_predictions"] = int(len(pred_conf))
-    return best
+    # Tier 2 — recall-anchored fallback: the strict gate failed, but the
+    # specialist might still produce usable pseudo-labels at a less aggressive
+    # threshold. Pick the threshold that MAXIMIZES PRECISION subject to
+    # recall >= min_recall. This avoids the old failure mode where the model
+    # picked the conf at which precision peaked (often 1 detection in entire
+    # val set → P=1.0, R=0.001 — useless for pseudo-labeling).
+    recall_mask = recall >= min_recall
+    if recall_mask.any():
+        precision_when_recall_ok = np.where(recall_mask, precision, -1)
+        i = int(np.argmax(precision_when_recall_ok))
+        return {
+            "passed": False,
+            "mode": "recall_anchored",
+            "reason": (f"strict gate failed (P>={target_precision} & "
+                       f"R>={min_recall}); fell back to max-precision at "
+                       f"R>={min_recall}"),
+            "threshold": float(confs[i]),
+            "precision": float(precision[i]),
+            "recall": float(recall[i]),
+            "tp": int(cum_tp[i]),
+            "fp": int(cum_fp[i]),
+            "total_gt": int(total_gt),
+            "n_predictions": int(len(pred_conf)),
+        }
+
+    # Tier 3 — F1-optimal last resort: even the recall floor is unreachable.
+    # F1 = 2PR/(P+R) gives the most balanced operating point. Still usable as
+    # a diagnostic threshold even though pseudo-labels would be sparse.
+    f1 = 2 * precision * recall / np.maximum(precision + recall, 1e-10)
+    i = int(np.argmax(f1))
+    return {
+        "passed": False,
+        "mode": "f1_optimal",
+        "reason": (f"strict gate failed AND R>={min_recall} unreachable; "
+                   f"fell back to F1-optimal threshold"),
+        "threshold": float(confs[i]),
+        "precision": float(precision[i]),
+        "recall": float(recall[i]),
+        "f1": float(f1[i]),
+        "tp": int(cum_tp[i]),
+        "fp": int(cum_fp[i]),
+        "total_gt": int(total_gt),
+        "n_predictions": int(len(pred_conf)),
+    }
 
 
 # ── Per-specialist driver ────────────────────────────────────────────────────
@@ -245,19 +316,25 @@ def find_specialist_threshold(condition: str, *, arch: str | None = None) -> dic
     arch="yolo26s" / "rtdetr-l" / "frcnn-r50" / "detr-r50" / ... operates on
     the sweep candidate at runs/sweep/<arch>/specialist_<cond>/.
     """
-    cfg = yaml.safe_load(PIPELINE_CFG.read_text())
+    cfg = yaml.safe_load(PIPELINE_CFG.read_text(encoding="utf-8"))
     run_dir = specialist_run_dir(condition, arch)
     ckpt = run_dir / "weights" / "best.pt"
     if not ckpt.exists():
         raise FileNotFoundError(f"No trained specialist at {ckpt}")
 
     # Derive effective arch (for adapter dispatch) when caller didn't pass one.
-    effective_arch = arch or slug_from_weight(
+    # Order of preference for the canonical specialist dir (arch=None):
+    #   1. existing kpi_gate.json (copied by promote.py from the winning sweep)
+    #   2. runs/sweep/promotions.json
+    #   3. pipeline.yaml weight slug (legacy default)
+    # Without this, conditions promoted from frcnn-r50 / detr-r50 would crash
+    # here trying to YOLO()-load a non-Ultralytics checkpoint.
+    effective_arch = arch or _detect_promoted_arch(condition) or slug_from_weight(
         cfg["specialists"][condition]["weight"]
     )
 
     data_yaml_path = ROOT / "data" / "processed" / condition / "dataset.yaml"
-    data_yaml = yaml.safe_load(data_yaml_path.read_text())
+    data_yaml = yaml.safe_load(data_yaml_path.read_text(encoding="utf-8"))
     base = Path(data_yaml["path"])
     val_img_rel = data_yaml["val"]
     val_img = base / val_img_rel
@@ -277,8 +354,7 @@ def find_specialist_threshold(condition: str, *, arch: str | None = None) -> dic
 
     result = find_threshold(pred_conf, pred_tp, total_gt)
     result["condition"] = condition
-    if arch:
-        result["arch"] = arch
+    result["arch"] = effective_arch   # always record — downstream depends on it
 
     out_path = run_dir / "threshold.json"
     out_path.write_text(json.dumps(result, indent=2))
@@ -286,15 +362,48 @@ def find_specialist_threshold(condition: str, *, arch: str | None = None) -> dic
     return result
 
 
+def _detect_promoted_arch(condition: str) -> str | None:
+    """Look up which arch was promoted for `condition` into runs/specialists/.
+    Returns None if no promotion record exists (caller falls back to pipeline
+    yaml). Used by find_specialist_threshold when arch=None so we don't
+    YOLO()-load a torchvision/HF checkpoint."""
+    canonical_dir = specialist_run_dir(condition, None)
+    # Prefer kpi_gate.json next to the checkpoint — promote.py copies it from
+    # the winning sweep run, so it always carries the right arch.
+    kpi_path = canonical_dir / "kpi_gate.json"
+    if kpi_path.exists():
+        try:
+            kpi = json.loads(kpi_path.read_text(encoding="utf-8"))
+            if kpi.get("arch"):
+                return str(kpi["arch"])
+        except (json.JSONDecodeError, OSError):
+            pass
+    # Fallback: read the promotions manifest.
+    promotions_path = ROOT / "runs" / "sweep" / "promotions.json"
+    if promotions_path.exists():
+        try:
+            pr = json.loads(promotions_path.read_text(encoding="utf-8"))
+            entry = pr.get("promotions", {}).get(condition, {})
+            if entry.get("arch"):
+                return str(entry["arch"])
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
 def _summarize(condition: str, r: dict) -> str:
     if r.get("passed"):
         return (f"  [{condition}] PASS conf>={r['threshold']:.4f}  "
                 f"P={r['precision']:.3f}  R={r['recall']:.3f}  "
                 f"GT={r['total_gt']}  preds={r['n_predictions']}")
-    if "best_precision_seen" in r:
-        return (f"  [{condition}] FAIL — best P={r['best_precision_seen']:.3f} "
-                f"@ conf>={r['threshold_at_best_precision']:.4f} "
-                f"(R={r['recall_at_best_precision']:.3f})")
+    # New 3-tier fallback modes (recall_anchored, f1_optimal) all carry a
+    # usable threshold + precision/recall pair. Show them so the user sees
+    # actual numbers instead of just a reason string.
+    if "threshold" in r and "precision" in r and "recall" in r:
+        mode = r.get("mode", "fallback")
+        return (f"  [{condition}] FAIL ({mode}) conf>={r['threshold']:.4f}  "
+                f"P={r['precision']:.3f}  R={r['recall']:.3f}  "
+                f"GT={r.get('total_gt', 0)}  preds={r.get('n_predictions', 0)}")
     return f"  [{condition}] FAIL — {r.get('reason', 'unknown')}"
 
 

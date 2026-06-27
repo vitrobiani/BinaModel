@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import random
@@ -33,7 +34,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
 from train.train_specialist import hpo_best_json, hpo_project_dir  # noqa: E402
 
@@ -115,7 +116,11 @@ def _train_one_trial(
 
     lr0 = trial.suggest_float("lr0", 1e-5, 1e-1, log=True)
     weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)
-    batch = trial.suggest_categorical("batch", [16, 32, 64])
+    # Capped at 16 because yolo26x at imgsz=640 OOMs above that on a 4070 12GB,
+    # and Ultralytics' batch-autoshrink doesn't release VRAM cleanly between
+    # trials. Each Optuna trial gets a fresh process via `model.train` so the
+    # GPU is reset, but the search space itself must stay within fit-on-card.
+    batch = trial.suggest_categorical("batch", [4, 8, 16])
 
     model = YOLO(weight)
     name = f"hpo_{condition}_t{trial.number}"
@@ -133,6 +138,10 @@ def _train_one_trial(
             lr0=lr0,
             weight_decay=weight_decay,
             warmup_epochs=min(3, max(1, epochs // 3)),
+            # Windows spawn-based dataloader re-imports torch in each worker;
+            # 8 workers exhausts the pagefile (WinError 1455). 2 is enough for
+            # a 295-image subset and avoids the crash.
+            workers=2,
             save=False,
             plots=False,
             val=True,
@@ -142,6 +151,39 @@ def _train_one_trial(
     except Exception as e:  # noqa: BLE001 — Optuna swallows; we log and return 0
         print(f"  trial {trial.number} crashed: {e!r}")
         return 0.0
+    finally:
+        # Force-release model + CUDA cache between trials. Ultralytics
+        # doesn't free VRAM on its own, so after ~4 trials the 4070 12GB
+        # fragments enough that the next trial OOMs at allocation time.
+        try:
+            del model
+        except UnboundLocalError:
+            pass
+        _release_cuda()
+
+
+def _release_cuda() -> None:
+    """Force GC + CUDA cache release. Call after dropping local model refs."""
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:  # noqa: BLE001
+                pass
+    except ImportError:
+        pass
+
+
+def _is_ultralytics_arch(arch: str | None) -> bool:
+    """HPO currently uses `ultralytics.YOLO(weight).train(...)` directly, so
+    it only works for the Ultralytics family. Non-Ultralytics archs (FRCNN,
+    DETR) get HPO skipped cleanly until we re-route this through adapters."""
+    if not arch:
+        return True
+    return arch.startswith("yolo") or arch.startswith("rtdetr")
 
 
 def run_hpo(
@@ -162,9 +204,30 @@ def run_hpo(
 
     If `arch` is set and `weight_override` isn't, the base weight defaults to
     f"{arch}.pt" — convenient for sweeps over yolo26s/yolo26x/rtdetr-l/etc.
+
+    Non-Ultralytics archs (frcnn-r50, detr-r50) currently get a clean skip;
+    training uses pipeline.yaml defaults. Proper adapter-routed HPO is a
+    follow-up.
     """
+    if not _is_ultralytics_arch(arch):
+        print(f"  HPO skipped: arch={arch} is non-Ultralytics; "
+              f"training will use pipeline.yaml + recession.yaml defaults. "
+              f"(Adapter-routed HPO is a Phase 1B follow-up.)")
+        summary = {
+            "condition": condition,
+            "arch": arch,
+            "skipped": True,
+            "reason": "non-Ultralytics arch; HPO not yet wired through adapters",
+            "top3": [],
+            "best": None,
+        }
+        out_path = hpo_best_json(condition, arch)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        return summary
+
     optuna = _import_optuna()
-    cfg = yaml.safe_load(PIPELINE_CFG.read_text())
+    cfg = yaml.safe_load(PIPELINE_CFG.read_text(encoding="utf-8"))
     spec = cfg["specialists"][condition]
     weight = weight_override or (f"{arch}.pt" if arch else spec["weight"])
     device = str(cfg["project"].get("device", "0"))
