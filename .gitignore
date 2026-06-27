@@ -1,4 +1,4 @@
-# ── Data ─────────────────────────────────────────────────────
+# ── Data ───────────────────────────────────────────────────── 
 # Processed datasets + pseudo-labels (~19 GB), regenerable by normalize.py
 /data/
 # Raw source datasets (see configs/models/*.yaml for sources)
